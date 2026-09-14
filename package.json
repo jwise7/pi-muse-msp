@@ -1,0 +1,11 @@
+{
+  "name": "pi-muse-msp",
+  "version": "0.1.0",
+  "description": "Muse MSP provider extension for Pi",
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
