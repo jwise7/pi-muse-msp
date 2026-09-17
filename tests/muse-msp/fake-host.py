@@ -41,6 +41,33 @@ def notify(method, params):
     send({"jsonrpc": "2.0", "method": method, "params": params})
 
 
+def next_session_id():
+    # Cross-process counter (kept in HOME, which tests isolate per case)
+    # so a fresh session/start in a NEW process mints a NEW id. Without
+    # this every process restarts at ...000001 and stale-entry eviction
+    # is unobservable.
+    global session_count
+    try:
+        counter_path = os.path.join(os.path.expanduser("~"), ".fake-msp-session-counter")
+        try:
+            with open(counter_path) as f:
+                session_count = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            pass
+        session_count += 1
+        with open(counter_path, "w") as f:
+            f.write(str(session_count))
+    except OSError:
+        session_count += 1
+    return f"00000000-0000-7000-8000-{session_count:012d}"
+
+
+# Every spawned host records its argv once, so posture tests can prove which
+# flags each generation ran with (method-count assertions ignore this line).
+with open(log_path, "a") as _argv_log:
+    _argv_log.write("argv:" + " ".join(sys.argv[1:]) + "\n")
+
+
 def write_durable_completed(session_id, turn_id, text):
     millis = int(session_id.replace("-", "")[:12], 16)
     date = datetime.datetime.fromtimestamp(millis / 1000, datetime.timezone.utc)
@@ -84,42 +111,56 @@ for line in sys.stdin:
     with open(log_path, "a") as log:
         log.write(method + "\n")
     if method == "initialize":
-        if "--trust-workspace" in sys.argv:
+        # Both postures pass --trust-workspace now; the sandboxed host is the
+        # one WITHOUT --disable-sandbox.
+        if "--disable-sandbox" not in sys.argv:
             delay = float(os.environ.get("FAKE_DELAY_TRUST_INITIALIZE", "0") or 0)
             if delay:
                 time.sleep(delay)
         result(message, {"schema": {"fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"}})
     elif method == "model/list":
+        if os.environ.get("FAKE_HANG_MODELLIST") == "1":
+            continue
         result(message, {"models": []})
+    elif method == "skill/list":
+        result(message, {"skills": [
+            {"selector": "pi-session-context", "displayName": "Pi Session Context", "source": "user"},
+            {"selector": "acme:deploy", "displayName": "Deploy", "source": "plugin", "pluginId": "acme"},
+        ]})
+    elif method == "session/list":
+        sessions = [{"sessionId": session_id, "modelId": "muse-spark-1.3",
+                     "updatedAt": "2026-09-17T00:00:00Z", "status": "idle"}]
+        if os.environ.get("FAKE_LIST_EXTRA") == "1":
+            sessions.append({"sessionId": "99999999-9999-7999-8999-999999999999",
+                             "modelId": "muse-spark-1.2", "updatedAt": "2026-09-01T00:00:00Z",
+                             "status": "notLoaded"})
+        result(message, {"sessions": sessions, "nextCursor": None})
     elif method == "session/start":
-        # Cross-process counter (kept in HOME, which tests isolate per case)
-        # so a fresh session/start in a NEW process mints a NEW id. Without
-        # this every process restarts at ...000001 and stale-entry eviction
-        # is unobservable.
-        try:
-            counter_path = os.path.join(os.path.expanduser("~"), ".fake-msp-session-counter")
-            try:
-                with open(counter_path) as f:
-                    session_count = int(f.read().strip() or 0)
-            except (OSError, ValueError):
-                pass
-            session_count += 1
-            with open(counter_path, "w") as f:
-                f.write(str(session_count))
-        except OSError:
-            session_count += 1
-        session_id = f"00000000-0000-7000-8000-{session_count:012d}"
+        if os.environ.get("FAKE_HANG_START") == "1":
+            continue
+        session_id = next_session_id()
         provider = (message.get("params") or {}).get("providerId")
         with open(log_path, "a") as log:
             log.write(f"session/start provider={provider}\n")
         dump_input({"method": "session/start", "params": message.get("params") or {}})
         result(message, {"session": {"sessionId": session_id, "providerId": provider}})
     elif method == "session/resume":
+        if os.environ.get("FAKE_HANG_RESUME") == "1":
+            continue
         if os.environ.get("FAKE_RESUME_FAIL") == "1":
             send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32000, "message": "unknown session"}})
             continue
-        # The extension only reads session.sessionId from this response.
-        result(message, {"session": {"sessionId": session_id}, "history": {"mode": "none"}, "pendingRequests": [], "viewCursor": "v:1"})
+        pending = [{"kind": "approval", "approvalId": "approval-9", "viewCursor": "v:9"}] \
+            if os.environ.get("FAKE_RESUME_PENDING") == "1" else []
+        result(message, {"session": {"sessionId": session_id}, "history": {"mode": "none"}, "pendingRequests": pending, "viewCursor": "v:1"})
+    elif method == "session/setModel":
+        model = ((message.get("params") or {}).get("model") or {}).get("modelId")
+        with open(log_path, "a") as log:
+            log.write(f"session/setModel model={model}\n")
+        result(message, {"status": "accepted"})
+    elif method == "session/fork":
+        session_id = next_session_id()
+        result(message, {"session": {"sessionId": session_id}, "history": {"mode": "none"}, "pendingRequests": [], "viewCursor": "v:9"})
     elif method == "turn/start":
         turn_count += 1
         turn_id = message["params"]["commandId"]
@@ -128,6 +169,16 @@ for line in sys.stdin:
             continue
         result(message, {"commandId": turn_id, "status": "accepted", "turnId": turn_id, "startedNewTurn": True, "disposition": "started"})
         notify("turn/started", {"sessionId": session_id, "turnId": turn_id})
+        # Independent top-ups, composable with any flow below.
+        if os.environ.get("FAKE_NOTIFY_TODOS") == "1":
+            notify("session/todoListChanged", {"sessionId": session_id, "items": [
+                {"text": "Write code", "status": "completed"},
+                {"text": "Write tests", "status": "completed"},
+            ]})
+        if os.environ.get("FAKE_NOTIFY_CONTEXT") == "1":
+            notify("session/contextUsage", {"sessionId": session_id, "pressure": "warning", "usedTokens": 800000, "windowTokens": 1000000})
+        if os.environ.get("FAKE_NOTIFY_VIEWHEALTH") == "1":
+            notify("session/viewHealthChanged", {"sessionId": session_id, "health": "unavailable", "noneReason": "projectionUnavailable"})
         inputs = message.get("params", {}).get("input") or []
         dump_input({
             "method": "turn/start",
@@ -178,8 +229,41 @@ for line in sys.stdin:
                     "selection": {"mode": "single"},
                 }],
             })
+        elif os.environ.get("FAKE_CANCELLED") == "1":
+            notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "cancelled", "reason": "server stopped it"})
+        elif os.environ.get("FAKE_UNKNOWN_TERMINAL") == "1":
+            notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "evaporated", "reason": "melted"})
+        elif os.environ.get("FAKE_RETRY_FLOW") == "1":
+            notify("turn/retryScheduled", {"sessionId": session_id, "turnId": turn_id, "attempt": 1, "maxAttempts": 3, "nextAttempt": 2, "retryDelayMs": 2000, "reason": "model overloaded"})
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "RETRY-ANSWER"}})
+            notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed"})
+        elif os.environ.get("FAKE_USAGE") == "1":
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "USAGE-ANSWER"}})
+            notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed", "usage": {"inputTokens": 101, "outputTokens": 202}})
+        elif os.environ.get("FAKE_ODD_ITEM") == "1":
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "tp-1", "turnId": turn_id, "kind": "teleport", "fallbackText": "beamed up"}})
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "ODD-ANSWER"}})
+            notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed"})
+        elif os.environ.get("FAKE_ITEMS") == "1":
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "sg-1", "turnId": turn_id, "kind": "subagent", "agentPath": "researcher", "objective": "find docs", "subagentId": "sub-9", "childSessionId": "cs-1", "status": "completed"}})
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "tc-1", "turnId": turn_id, "kind": "toolCall", "tool": "bash", "args": "{\"command\": \"ls\"}", "status": "completed", "outputRef": {"id": "out-7", "kind": "tool_output"}}})
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "wf-1", "turnId": turn_id, "kind": "workflow", "fallbackText": "deploy", "status": "completed", "children": [
+                {"childId": "a", "terminal": "completed"}, {"childId": "b", "terminal": "completed"}, {"childId": "c", "terminal": "failed"},
+            ]}})
+            notify("item/updated", {"sessionId": session_id, "item": {"itemId": "tc-2", "turnId": turn_id, "kind": "toolCall", "tool": "bash", "args": "{\"command\": \"sleep 60\"}", "background": True}})
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "ITEMS-ANSWER"}})
+            notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed"})
     elif method == "approval/listPending":
-        result(message, {"approvals": [], "userInputs": []})
+        if os.environ.get("FAKE_RESUME_PENDING") == "1":
+            result(message, {"approvals": [{
+                "sessionId": session_id, "approvalId": "approval-9",
+                "currentRequirementId": {"approvalId": "approval-9", "sourceIndex": 0},
+                "toolName": "bash", "availableChoices": [
+                    {"choiceId": "allow_once", "decision": "approved", "scope": "once", "label": "Allow once"},
+                ],
+            }], "userInputs": []})
+        else:
+            result(message, {"approvals": [], "userInputs": []})
     elif method == "approval/decide":
         assert message["params"]["choiceId"] == "allow_once"
         if os.environ.get("FAKE_ALREADY_RESOLVED") == "1":
@@ -197,3 +281,9 @@ for line in sys.stdin:
         result(message, {"status": "accepted"})
     elif method in ("userInput/cancel", "userInput/answer", "userInput/clarify"):
         result(message, {"status": "accepted"})
+    elif method == "subagent/readResult":
+        assert message["params"]["subagentId"] == "sub-9", message["params"]
+        result(message, {"summary": "Docs found", "text": "SUBAGENT-RESULT-TEXT"})
+    elif method == "item/readOutput":
+        assert message["params"]["outputRef"] == "out-7", message["params"]
+        result(message, {"content": "TOOL-OUTPUT-BYTES", "eof": True, "byteLen": 17, "offsetBytes": 0, "mediaType": "text/plain"})

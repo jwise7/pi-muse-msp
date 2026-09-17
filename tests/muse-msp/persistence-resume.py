@@ -10,28 +10,34 @@ run2: same Pi session continued in a NEW process (-p follow-up) -> the new
       which reuses the in-memory live session and never touches the index.)
 run3: FAKE_RESUME_FAIL=1 -> stale entry dropped, fresh session/start x1.
 run4: expired savedAt -> entry ignored without even attempting resume.
+run5: FAKE_HANG_RESUME=1 -> resume ack never arrives, bounded wait then fresh start.
+run6: FAKE_RESUME_PENDING=1 -> adopted session's pending approval is pulled
+      and auto-decided.
 """
 import json
 import os
 import pathlib
 import subprocess
-import tempfile
+import sys
 
 here = pathlib.Path(__file__).resolve().parent
 extension = here.parents[1] / "extensions/muse-msp.ts"
+
+sys.path.insert(0, str(here))
+import rpc_harness as harness
 first = "Persist probe alpha"
 second = "follow-up beta"
 
 
-def run(home, *messages, extra_env=None):
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="pi-msp-persist.", dir="/tmp"))
+def run(home, *messages, extra_env=None, expected="VISIBLE-ANSWER", reasoning=True):
+    tmp = harness.mkdtemp("pi-msp-persist.")
     log = tmp / "msp.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith("FAKE_")}
     env.update(
         HOME=str(home),
         PI_MUSE_BINARY=str(here / "fake-host.py"),
         FAKE_MSP_LOG=str(log),
-        FAKE_REASONING="1",
+        **({"FAKE_REASONING": "1"} if reasoning else {}),
         **(extra_env or {}),
     )
     input_log = tmp / "input.log"
@@ -43,13 +49,13 @@ def run(home, *messages, extra_env=None):
         env=env, text=True, capture_output=True, timeout=60, cwd=str(home),
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert "VISIBLE-ANSWER" in result.stdout + result.stderr, (result.stdout, result.stderr)
+    assert expected in result.stdout + result.stderr, (result.stdout, result.stderr)
     calls = log.read_text().splitlines()
     inputs = [json.loads(line) for line in input_log.read_text().splitlines()] if input_log.exists() else []
     return calls, inputs
 
 
-home = pathlib.Path(tempfile.mkdtemp(prefix="pi-msp-home.", dir="/tmp"))
+home = harness.mkdtemp("pi-msp-home.")
 
 # run1: fresh start, index written
 calls1, _ = run(home, first)
@@ -88,4 +94,19 @@ calls4, _ = run(home, second)
 assert "session/resume" not in calls4, calls4
 assert calls4.count("session/start") == 1, calls4
 
-print("PASS: persisted sessions resume across processes; stale/expired entries fall back to fresh")
+# run5: resume ack never arrives -> bounded wait, then fresh start (run4 left
+# a valid entry behind, so resume is attempted this time).
+calls5, _ = run(home, "gamma follow-up", extra_env={"FAKE_HANG_RESUME": "1"})
+assert calls5.count("session/resume") == 1, calls5
+assert calls5.count("session/start") == 1, calls5
+
+# run6: adopted session reports a pending approval -> pulled via listPending
+# and auto-decided (run5 left a valid entry behind). The turn itself hangs,
+# as a truly blocked turn would, so the approval settles it.
+calls6, _ = run(home, "delta follow-up", extra_env={"FAKE_RESUME_PENDING": "1"},
+                expected="AUTO-APPROVED", reasoning=False)
+assert calls6.count("session/resume") == 1, calls6
+assert calls6.count("session/start") == 0, calls6
+assert calls6.count("approval/decide") == 1, calls6
+
+print("PASS: persisted sessions resume across processes; stale/expired/hung entries fall back to fresh; resumed pending approvals decide")

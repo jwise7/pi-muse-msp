@@ -10,6 +10,11 @@ One `muse serve` host per Pi process (lazy singleton). One MSP session per Pi ch
 - Session start for Spark must send `providerId: "meta"`; `modelId` alone routes to provider `muse`, which rejects retained tool-read images. On retained-media failure: drop the session (no `keepLive`), retry once as fresh-session vision input, then surface the error — never loop or silently drop images.
 - `muse serve` has no `--yolo`: default to approval-mode allow-all, auto-select an approved choice if a request still arrives, Pi UI only as fallback. `approvalAlreadyResolved` is benign.
 - On `session_shutdown`, dispose the extension-owned child with a bounded `SIGKILL` fallback. Never broad-`pkill muse serve` — each Pi chat owns one; kill only a proven stale child of the target Pi process.
+- Session identity (turn chain, live/persisted entry, UI bridge, steer/fork lookup) keys on the process cwd via `sessionCwd()` — never `ctx.cwd`. The provider stream has no ctx, so any other source would fork the key space.
+- Pi applies CLI extension flags after the startup model refresh, so refresh reuses any existing host and otherwise spawns sandboxed (safe default) — never unsandboxed-first, and never a respawn just to list models (that would kill live sessions).
+- Mid-chat `/model` switch within the provider family moves the live session via `session/setModel` (no restart, no history replay); provider jumps fresh-start instead.
+- `/muse-msp-fork` rebinds the chat to a whole-history fork of its live session; forking is refused while a turn is in flight.
+- Todo, context-pressure, and view-health notifications surface as thinking notes and working-message state. A server-confirmed dead projector skips the salvage grace period.
 
 ## Verify
 

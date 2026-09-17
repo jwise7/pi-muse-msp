@@ -4,14 +4,16 @@ import json
 import os
 import pathlib
 import subprocess
-import tempfile
+import sys
 
-here = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import rpc_harness as harness
+
 helper = pathlib.Path.home() / ".config/muse/skills/pi-session-context/origin.mjs"
 if not helper.is_file():
     print("SKIP: pi-session-context origin.mjs not installed")
     raise SystemExit(0)
-agent_home = pathlib.Path(tempfile.mkdtemp(prefix="pi-origin-home.", dir="/tmp"))
+agent_home = harness.mkdtemp("pi-origin-home.")
 agent_dir = agent_home / ".pi" / "agent"
 agent_dir.mkdir(parents=True)
 env = {**os.environ, "PI_CODING_AGENT_DIR": str(agent_dir)}

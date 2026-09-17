@@ -15,10 +15,13 @@ import json
 import os
 import pathlib
 import subprocess
-import tempfile
+import sys
 
 here = pathlib.Path(__file__).resolve().parent
 msp_ext = here.parents[1] / "extensions/muse-msp.ts"
+
+sys.path.insert(0, str(here))
+import rpc_harness as harness
 
 
 def find_inbox_ext():
@@ -34,7 +37,7 @@ def find_inbox_ext():
 
 
 def run_turn(home, extra_exts=()):
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="pi-msp-inbox.", dir="/tmp"))
+    tmp = harness.mkdtemp("pi-msp-inbox.")
     log = tmp / "msp.log"
     input_log = tmp / "input.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith("FAKE_")}
@@ -52,7 +55,7 @@ def run_turn(home, extra_exts=()):
     return input_log
 
 
-home = pathlib.Path(tempfile.mkdtemp(prefix="pi-msp-inbox-home.", dir="/tmp"))
+home = harness.mkdtemp("pi-msp-inbox-home.")
 agent_dir = home / ".pi" / "agent"
 agent_dir.mkdir(parents=True)
 

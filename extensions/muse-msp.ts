@@ -42,40 +42,13 @@ const PROVIDER_ID = "muse-msp";
 const MSP_API = "muse-msp" as Api;
 const API_PROVIDER_SOURCE = "local:muse-msp";
 const MSP_FINGERPRINT = process.env.PI_MUSE_MSP_FINGERPRINT?.trim() ?? "";
-const CLIENT_VERSION = "0.1.0";
+const CLIENT_VERSION = "0.2.0";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 interface MspImage {
 	mediaType: string;
 	base64Data: string;
-	/** Local path the bytes came from, when known. Never sent on the wire; used for notices. */
-	source?: string;
-}
-
-/** sha256 hex of image bytes; keys imageSources. */
-function imageDigestOf(base64Data: string): string {
-	return createHash("sha256").update(base64Data).digest("hex");
-}
-
-/** Human-readable origin for an image ("..." when unknown). Never sent on the wire. */
-const imageSources = new Map<string, string>();
-/** Cap label memory: only recent attachments need human-readable names. */
-const IMAGE_SOURCES_MAX = 200;
-
-function imageLabel(image: MspImage): string {
-	return (
-		image.source ??
-		imageSources.get(imageDigestOf(image.base64Data)) ??
-		`attached image (${image.mediaType})`
-	);
-}
-
-interface MspUsage {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
 }
 
 function uuid7(): string {
@@ -92,10 +65,19 @@ function museBinary(): string {
 	return process.env.PI_MUSE_BINARY?.trim() || "muse";
 }
 
-function mspSandboxed(pi: ExtensionAPI): boolean {
-	if (pi.getFlag("muse-msp-sandboxed") === true) return true;
+function envSandboxed(): boolean {
 	return /^(1|true|yes)$/i.test(process.env.PI_MUSE_MSP_SANDBOXED?.trim() ?? "");
 }
+
+function mspSandboxed(pi: ExtensionAPI): boolean {
+	if (pi.getFlag("muse-msp-sandboxed") === true) return true;
+	return envSandboxed();
+}
+
+// Authoritative posture from the most recent turn. Pi applies CLI extension
+// flags after the startup model refresh, so a flag read at refresh time may
+// still be the default — the turn path records the real value here instead.
+let lastMspSandboxed: boolean | null = null;
 
 function reasoningEffort(level: ThinkingLevel | undefined): string | undefined {
 	if (level === undefined) return undefined;
@@ -172,15 +154,19 @@ class MspHost {
 		return this.fingerprint;
 	}
 
+	/** Posture of the current host, or null when no host exists. */
+	currentSandboxed(): boolean | null {
+		return this.sandboxed;
+	}
+
 	private spawn(sandboxed: boolean): { generation: number; promise: Promise<void> } {
 		const generation = ++this.generation;
 		this.spawnError = null;
 		this.fingerprint = null;
 		this.buffer = "";
 		const promise = new Promise<void>((resolve) => {
-			const args = ["serve"];
+			const args = ["serve", "--trust-workspace"];
 			if (!sandboxed) args.push("--disable-sandbox");
-			else args.push("--trust-workspace");
 			const child = spawn(museBinary(), args, {
 				stdio: ["pipe", "pipe", "pipe"],
 				shell: false,
@@ -191,7 +177,9 @@ class MspHost {
 			const isCurrent = () => this.child === child && this.generation === generation;
 
 			child.stderr?.on("data", (chunk) => {
-				stderr += chunk.toString();
+				// The host lives for days but only the tail is ever read
+				// (exit message), so don't retain the whole stream.
+				stderr = `${stderr}${chunk.toString()}`.slice(-2000);
 			});
 			child.on("error", (error) => {
 				if (!isCurrent()) {
@@ -377,7 +365,11 @@ class MspHost {
 		}
 	}
 
-	request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+	request(
+		method: string,
+		params: Record<string, unknown>,
+		timeout?: { ms: number; label: string },
+	): Promise<Record<string, unknown>> {
 		const child = this.child;
 		if (!child || !child.stdin || child.killed) {
 			return Promise.reject(new Error("muse serve host is not running"));
@@ -387,17 +379,33 @@ class MspHost {
 		debugLog(`-> ${method} (id=${id}, generation=${generation})`);
 		const release = this.hold();
 		return new Promise((resolve, reject) => {
-			this.pending.set(id, {
+			let timer: ReturnType<typeof setTimeout> | null = null;
+			const entry: Pending = {
 				generation,
 				resolve: (value) => {
+					if (timer) clearTimeout(timer);
 					release();
 					resolve(value);
 				},
 				reject: (error) => {
+					if (timer) clearTimeout(timer);
 					release();
 					reject(error);
 				},
-			});
+			};
+			this.pending.set(id, entry);
+			if (timeout) {
+				// A timed-out call leaves the wire: drop its pending entry so
+				// a late (or never) response can't resolve an abandoned turn,
+				// and release the event-loop hold with it.
+				timer = setTimeout(() => {
+					if (this.pending.get(id) === entry) {
+						this.pending.delete(id);
+						entry.reject(new Error(`${timeout.label} timed out`));
+					}
+				}, timeout.ms);
+				timer.unref();
+			}
 			child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`, (error) => {
 				if (error) {
 					const pending = this.pending.get(id);
@@ -518,30 +526,7 @@ function userMessageParts(
 	for (const part of message.content) {
 		const record = part as unknown as Record<string, unknown>;
 		if (record["type"] === "text") textParts.push(String(record["text"] ?? ""));
-		else {
-			const before = images.length;
-			partImages(record, images);
-			// Remember where user-attached bytes came from so a later
-			// media-stripping notice can name the path (labels only).
-			for (let i = before; i < images.length; i++) {
-				const image = images[i];
-				if (!image || image.source) continue;
-				const name =
-					typeof record["name"] === "string" && record["name"]
-						? String(record["name"])
-						: typeof record["path"] === "string" && record["path"]
-							? String(record["path"])
-							: undefined;
-				if (name) {
-				imageSources.set(imageDigestOf(image.base64Data), name);
-				while (imageSources.size > IMAGE_SOURCES_MAX) {
-					const oldest = imageSources.keys().next();
-					if (oldest.done) break;
-					imageSources.delete(oldest.value);
-				}
-			}
-			}
-		}
+		else partImages(record, images);
 	}
 	return textParts.join("\n");
 }
@@ -628,7 +613,7 @@ function fileToMspImage(path: string, mediaType?: string): MspImage | undefined 
 			mediaType && mediaType.toLowerCase().startsWith("image/")
 				? mediaType.toLowerCase()
 				: mimeFromPath(path);
-		return { mediaType: mime, base64Data: readFileSync(path).toString("base64"), source: path };
+		return { mediaType: mime, base64Data: readFileSync(path).toString("base64") };
 	} catch {
 		return undefined;
 	}
@@ -700,6 +685,20 @@ function systemPromptBlock(systemPrompt: string | undefined): string | null {
 	return systemPrompt;
 }
 
+function toolResultBlock(
+	message: Extract<Context["messages"][number], { role: "toolResult" }>,
+	images: MspImage[],
+): string {
+	for (const part of message.content) {
+		if (part.type === "image") images.push({ mediaType: part.mimeType, base64Data: part.data });
+	}
+	const text = message.content
+		.filter((part) => part.type === "text")
+		.map((part) => part.text)
+		.join("\n");
+	return `## Tool result: ${message.toolName}${message.isError ? " (error)" : ""}\n${text}`;
+}
+
 function conversationParts(context: Context): Array<Record<string, unknown>> {
 	if (!context.messages.some((message) => message.role === "user")) {
 		throw new Error("Muse MSP provider received no user task");
@@ -714,14 +713,7 @@ function conversationParts(context: Context): Array<Record<string, unknown>> {
 			const text = userMessageParts(message, images);
 			texts.push(onlyUser ? text : `## User\n${text}`);
 		} else if (message.role === "toolResult") {
-			for (const part of message.content) {
-				if (part.type === "image") images.push({ mediaType: part.mimeType, base64Data: part.data });
-			}
-			const text = message.content
-				.filter((part) => part.type === "text")
-				.map((part) => part.text)
-				.join("\n");
-			texts.push(`## Tool result: ${message.toolName}${message.isError ? " (error)" : ""}\n${text}`);
+			texts.push(toolResultBlock(message, images));
 		} else {
 			const content = message.content
 				.map((part) => {
@@ -744,14 +736,7 @@ function deltaParts(messages: Context["messages"]): Array<Record<string, unknown
 	for (const message of messages) {
 		if (message.role === "user") texts.push(userMessageParts(message, images));
 		else if (message.role === "toolResult") {
-			for (const part of message.content) {
-				if (part.type === "image") images.push({ mediaType: part.mimeType, base64Data: part.data });
-			}
-			const text = message.content
-				.filter((part) => part.type === "text")
-				.map((part) => part.text)
-				.join("\n");
-			texts.push(`## Tool result: ${message.toolName}${message.isError ? " (error)" : ""}\n${text}`);
+			texts.push(toolResultBlock(message, images));
 		}
 	}
 	const parts = toTurnParts(texts, images);
@@ -806,10 +791,14 @@ const TURN_START_ACK_TIMEOUT_MS = 5_000;
 
 type PersistedSession = LiveSession & { savedAt: number };
 
+function homeDir(): string {
+	return process.env.HOME?.trim() || homedir();
+}
+
 function agentDir(): string {
 	const configured = (process.env.PI_CODING_AGENT_DIR || "").trim();
 	if (configured) return configured;
-	return join(process.env.HOME?.trim() || homedir(), ".pi", "agent");
+	return join(homeDir(), ".pi", "agent");
 }
 
 function sessionIndexPath(): string {
@@ -909,35 +898,58 @@ function savePersistedSessions(): void {
 	}
 }
 
-/** Validate a persisted entry against the live host. Never throws. */
-async function resumePersistedSession(entry: PersistedSession): Promise<LiveSession | null> {
+/** Validate a persisted entry against the live host, reporting how many late-joiner
+ * requests (missed approvals/clarifications) came back with it. Never throws. */
+async function resumePersistedSession(
+	entry: PersistedSession,
+): Promise<{ live: LiveSession; pending: number } | null> {
 	try {
 		await host.ensure(entry.sandboxed);
 		const result = await host.request("session/resume", {
 			commandId: uuid7(),
 			sessionId: entry.sessionId,
-		});
+		}, { ms: HOST_RPC_TIMEOUT_MS, label: "session/resume" });
 		const session = result["session"] as Record<string, unknown> | undefined;
 		const id = session ? String(session["sessionId"] ?? "") : "";
 		if (!id) return null;
 		attached.add(id);
 		writeOriginFile({ sessionId: id, cwd: entry.cwd, model: entry.model, sandboxed: entry.sandboxed });
 		return {
-			sessionId: id,
-			cwd: entry.cwd,
-			model: entry.model,
-			sandboxed: entry.sandboxed,
-			messageCount: entry.messageCount,
-			prefixFp: entry.prefixFp,
+			live: {
+				sessionId: id,
+				cwd: entry.cwd,
+				model: entry.model,
+				sandboxed: entry.sandboxed,
+				messageCount: entry.messageCount,
+				prefixFp: entry.prefixFp,
+			},
+			pending: Array.isArray(result["pendingRequests"]) ? (result["pendingRequests"] as unknown[]).length : 0,
 		};
 	} catch {
 		return null;
 	}
 }
 
+/** Working directory for session identity. The provider stream has no ctx,
+ * so every session key (turn chain, live/persisted entry, UI bridge, steer
+ * and fork lookup) uses the process cwd — never ctx.cwd, which would fork
+ * the key space if it ever differed (silently dropping UI bridging and
+ * steering). Pi runs one cwd per process, so these are equal in practice. */
+function sessionCwd(): string {
+	return process.cwd();
+}
+
 function chatKey(cwd: string, model: string, messages: Context["messages"]): string {
 	const first = messages[0];
 	return `${cwd}\0${model}\0${first ? messageFingerprint(first) : ""}`;
+}
+
+/** A reuse suffix must be fresh user-side traffic only: no assistant turns
+ * (already in the session) and at least one user message. */
+function validUserSuffix(messages: Context["messages"]): Context["messages"] | null {
+	if (messages.length === 0 || messages.some((message) => message.role === "assistant")) return null;
+	if (!messages.some((message) => message.role === "user")) return null;
+	return messages;
 }
 
 function suffixForLive(
@@ -952,9 +964,7 @@ function suffixForLive(
 	if (fingerprintMessages(context.messages.slice(0, live.messageCount)) !== live.prefixFp) return null;
 	let rest = context.messages.slice(live.messageCount);
 	if (rest[0]?.role === "assistant") rest = rest.slice(1);
-	if (rest.length === 0 || rest.some((message) => message.role === "assistant")) return null;
-	if (!rest.some((message) => message.role === "user")) return null;
-	return rest;
+	return validUserSuffix(rest);
 }
 
 function latestUserSuffix(messages: Context["messages"]): Context["messages"] | null {
@@ -962,10 +972,81 @@ function latestUserSuffix(messages: Context["messages"]): Context["messages"] | 
 	while (end >= 0 && messages[end]?.role === "assistant") end--;
 	let start = end;
 	while (start >= 0 && messages[start]?.role !== "assistant") start--;
-	const rest = messages.slice(start + 1, end + 1);
-	if (rest.length === 0 || rest.some((message) => message.role === "assistant")) return null;
-	if (!rest.some((message) => message.role === "user")) return null;
-	return rest;
+	return validUserSuffix(messages.slice(start + 1, end + 1));
+}
+
+type CrossModelCandidate =
+	| { key: string; live: LiveSession }
+	| { key: string; persisted: PersistedSession };
+
+/** Same conversation under a different model (a mid-chat /model switch):
+ * prefix rules mirror adoption. Provider jumps are excluded — a session
+ * started for one provider cannot serve another. */
+function crossModelCandidate(
+	context: Context,
+	cwd: string,
+	bareModel: string,
+	sandboxed: boolean,
+): CrossModelCandidate | null {
+	for (const [key, live] of lives) {
+		if (live.model === bareModel || live.cwd !== cwd || live.sandboxed !== sandboxed) continue;
+		if (sparkUsesMeta(live.model) !== sparkUsesMeta(bareModel)) continue;
+		if (live.messageCount <= 0 || context.messages.length <= live.messageCount) continue;
+		if (fingerprintMessages(context.messages.slice(0, live.messageCount)) !== live.prefixFp) continue;
+		return { key, live };
+	}
+	const now = Date.now();
+	let best: { key: string; persisted: PersistedSession } | null = null;
+	for (const [key, entry] of loadPersistedSessions()) {
+		if (entry.model === bareModel || entry.cwd !== cwd || entry.sandboxed !== sandboxed) continue;
+		if (sparkUsesMeta(entry.model) !== sparkUsesMeta(bareModel)) continue;
+		if (now - entry.savedAt > SESSION_INDEX_TTL_MS) continue;
+		if (entry.messageCount <= 0 || context.messages.length <= entry.messageCount) continue;
+		if (fingerprintMessages(context.messages.slice(0, entry.messageCount)) !== entry.prefixFp) continue;
+		if (!best || entry.messageCount > best.persisted.messageCount) best = { key, persisted: entry };
+	}
+	return best;
+}
+
+/** Adopt a cross-model candidate onto the live session: resume when cold,
+ * setModel to the new model, and retire the old key (the session no longer
+ * matches it). Returns the adopted entry, or null to start fresh. Never throws. */
+async function switchSessionModel(
+	candidate: CrossModelCandidate,
+	bareModel: string,
+): Promise<{ live: LiveSession; pending: number } | null> {
+	try {
+		let live: LiveSession;
+		let pending = 0;
+		if ("live" in candidate) {
+			if (!attached.has(candidate.live.sessionId)) return null;
+			live = candidate.live;
+		} else {
+			const resumed = await resumePersistedSession(candidate.persisted);
+			if (!resumed) {
+				removePersistedSession(candidate.key);
+				return null;
+			}
+			live = resumed.live;
+			pending = resumed.pending;
+		}
+		await host.request("session/setModel", {
+			commandId: uuid7(),
+			sessionId: live.sessionId,
+			model: {
+				modelId: bareModel,
+				...(sparkUsesMeta(bareModel) ? { providerId: "meta" } : {}),
+			},
+		}, { ms: HOST_RPC_TIMEOUT_MS, label: "session/setModel" });
+		live.model = bareModel;
+		lives.delete(candidate.key);
+		removePersistedSession(candidate.key);
+		writeOriginFile({ sessionId: live.sessionId, cwd: live.cwd, model: bareModel, sandboxed: live.sandboxed });
+		debugLog(`switched session ${live.sessionId} to model ${bareModel}`);
+		return { live, pending };
+	} catch {
+		return null;
+	}
 }
 
 function enqueueTurn<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -1003,12 +1084,12 @@ async function startMspSession(cwd: string, model: string, sandboxed: boolean): 
 	};
 	let startResult: Record<string, unknown>;
 	try {
-		startResult = await host.request("session/start", baseStartParams);
+		startResult = await host.request("session/start", baseStartParams, { ms: HOST_RPC_TIMEOUT_MS, label: "session/start" });
 	} catch (error) {
 		// A strict server may reject unknown metadata: retry bare once.
 		debugLog(`session/start with piOrigin failed, retrying bare: ${error instanceof Error ? error.message : String(error)}`);
 		const { piOrigin: _dropped, ...bareStartParams } = baseStartParams;
-		startResult = await host.request("session/start", bareStartParams);
+		startResult = await host.request("session/start", bareStartParams, { ms: HOST_RPC_TIMEOUT_MS, label: "session/start" });
 	}
 	const session = startResult["session"] as Record<string, unknown>;
 	const sessionId = String(session["sessionId"]);
@@ -1032,6 +1113,38 @@ type ActiveTurn = {
 
 /** Exactly one entry per Pi chat with a turn in flight; cleared in finish(). */
 const activeTurns = new Map<string, ActiveTurn>();
+
+/** Drill-down targets for /muse-msp-subagent and /muse-msp-output: itemId to
+ * the session plus whichever durable handles the item carried. Bounded. */
+type ItemTarget = {
+	sessionId: string;
+	subagentId?: string;
+	childSessionId?: string;
+	outputRefId?: string;
+};
+const itemTargets = new Map<string, ItemTarget>();
+const ITEM_TARGETS_MAX = 100;
+
+function rememberItemTarget(sessionId: string, item: Record<string, unknown>): void {
+	const itemId = strField(item, "itemId");
+	if (!itemId) return;
+	const outputRef = item["outputRef"];
+	const outputRefId =
+		outputRef && typeof outputRef === "object" ? strField(outputRef as Record<string, unknown>, "id") : "";
+	const target: ItemTarget = { sessionId };
+	const subagentId = strField(item, "subagentId");
+	const childSessionId = strField(item, "childSessionId");
+	if (subagentId) target.subagentId = subagentId;
+	if (childSessionId) target.childSessionId = childSessionId;
+	if (outputRefId) target.outputRefId = outputRefId;
+	if (!target.subagentId && !target.outputRefId) return;
+	itemTargets.set(itemId, target);
+	while (itemTargets.size > ITEM_TARGETS_MAX) {
+		const oldest = itemTargets.keys().next();
+		if (oldest.done) break;
+		itemTargets.delete(oldest.value);
+	}
+}
 
 function bareModelId(id: string): string {
 	return id.includes("/") ? id.split("/").slice(1).join("/") : id;
@@ -1065,7 +1178,7 @@ async function steerRunningTurn(
 					base64Data: image.data,
 				})),
 			],
-		});
+		}, { ms: HOST_RPC_TIMEOUT_MS, label: "turn/steer" });
 		target.mark(`\n\n[muse-msp: steered running turn: ${oneLine(text, 120)}]`);
 		return { ok: true, turnId: String(result["turnId"] ?? target.turnId) };
 	} catch (error) {
@@ -1159,25 +1272,11 @@ function recordedAtMs(value: unknown): number {
 	return value;
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
-		timer.unref();
-		promise.then(
-			(value) => {
-				clearTimeout(timer);
-				resolve(value);
-			},
-			(error) => {
-				clearTimeout(timer);
-				reject(error);
-			},
-		);
-	});
-}
+/** Bound for host RPCs that must never hang a turn or command when the projector dies. */
+const HOST_RPC_TIMEOUT_MS = 5_000;
 
 function museSessionJsonl(sessionId: string): string | undefined {
-	const root = join(process.env.HOME?.trim() || homedir(), ".local/share/muse/sessions");
+	const root = join(homeDir(), ".local/share/muse/sessions");
 	const ms = uuid7UnixMs(sessionId);
 	if (ms === undefined) return undefined;
 	const date = new Date(ms);
@@ -1209,8 +1308,13 @@ function tailJsonlLines(path: string, maxBytes = 256_000): string[] {
 		const size = fstatSync(fd).size;
 		const start = Math.max(0, size - maxBytes);
 		const buf = Buffer.alloc(size - start);
-		readSync(fd, buf, 0, buf.length, start);
-		const lines = buf.toString("utf8").split("\n");
+		let offset = 0;
+		while (offset < buf.length) {
+			const read = readSync(fd, buf, offset, buf.length - offset, start + offset);
+			if (read === 0) break; // EOF: file shrank under us; parse what we got.
+			offset += read;
+		}
+		const lines = buf.subarray(0, offset).toString("utf8").split("\n");
 		if (start > 0) lines.shift();
 		return lines.filter((line) => line.trim());
 	} finally {
@@ -1248,6 +1352,10 @@ function committedPlaintext(event: Record<string, unknown>): string | undefined 
 	return text;
 }
 
+/** Wide scan window for answer recovery: the terminal marker and its committed
+ * messages can sit far apart in a long session log. */
+const RECOVERY_SCAN_MAX_BYTES = 4_000_000;
+
 /** Durable Muse log: plaintext progress, a finished reply after completed `terminal`, or a failed terminal plus tool-read images. Ignores `encrypted_content`. */
 function scanSessionLog(
 	sessionId: string,
@@ -1264,14 +1372,14 @@ function scanSessionLog(
 	const progress: string[] = [];
 	const images: MspImage[] = [];
 	const seenImage = new Set<string>();
-	for (const line of tailJsonlLines(path, 4_000_000).reverse()) {
+	for (const line of tailJsonlLines(path, RECOVERY_SCAN_MAX_BYTES).reverse()) {
 		let record: Record<string, unknown>;
 		try {
 			record = JSON.parse(line) as Record<string, unknown>;
 		} catch {
 			continue;
 		}
-		if (recordedAtMs(record["recorded_at"]) + 1000 < afterMs) break;
+		if (typeof record["recorded_at"] === "number" && recordedAtMs(record["recorded_at"]) + 1000 < afterMs) break;
 		const parsed = payloadEvent(record);
 		if (!parsed) continue;
 		if (!terminalRun && parsed.kind === "terminal") {
@@ -1334,7 +1442,7 @@ function latestCompletedAnswerFromLog(sessionId: string): string | undefined {
 	const path = museSessionJsonl(sessionId);
 	if (!path) return undefined;
 	const completedRuns = new Set<string>();
-	for (const line of tailJsonlLines(path, 4_000_000).reverse()) {
+	for (const line of tailJsonlLines(path, RECOVERY_SCAN_MAX_BYTES).reverse()) {
 		let record: Record<string, unknown>;
 		try {
 			record = JSON.parse(line) as Record<string, unknown>;
@@ -1510,6 +1618,15 @@ function activityLabel(item: Record<string, unknown>, kind: string): string {
 		const label = agent ? `subagent ${agent}` : "subagent";
 		return objective ? `${label}: ${objective}` : label;
 	}
+	if (kind === "workflow") {
+		const children = Array.isArray(item["children"])
+			? (item["children"] as Array<Record<string, unknown>>)
+			: [];
+		const done = children.filter((child) => child["terminal"] === "completed").length;
+		const base = oneLine(strField(item, "fallbackText"));
+		const progress = children.length ? `${done}/${children.length} children` : "";
+		return [progress, base].filter(Boolean).join(" · ") || kind;
+	}
 	return oneLine(strField(item, "fallbackText")) || kind;
 }
 
@@ -1542,8 +1659,8 @@ export function streamMuseMsp(
 	// Key the queue before the body runs: the first message never changes
 	// within a chat, so every turn of one chat shares a chain while
 	// different chats run concurrently.
-	const streamCwd = process.cwd();
-	const streamBareModel = model.id.includes("/") ? model.id.split("/").slice(1).join("/") : model.id;
+	const streamCwd = sessionCwd();
+	const streamBareModel = bareModelId(model.id);
 	const chainKey = chatKey(streamCwd, streamBareModel, context.messages);
 
 	void enqueueTurn(chainKey, async () => {
@@ -1560,6 +1677,10 @@ export function streamMuseMsp(
 		let sentImages = false;
 		let mediaRetry: "no" | "inflight" | "done" = "no";
 		let salvageAfterMs = Date.now();
+	let viewUnhealthy = false;
+	let todoCompleteNoted = false;
+	let lastPressure = "";
+	const backgroundNoted = new Set<string>();
 		const seenThoughts = new Set<string>();
 		let queueVisionRetry = (_images: MspImage[]): void => {};
 		let liveEntry: LiveSession | null = null;
@@ -1703,13 +1824,10 @@ export function streamMuseMsp(
 				let automaticError = "no automatic approval choice was offered";
 				if (choice) {
 					try {
-						await withTimeout(
-							host.request("approval/decide", {
-								commandId: uuid7(), sessionId, approvalId,
-								choiceId: strField(choice, "choiceId"), requirementId,
-							}),
-							5_000, "approval/decide",
-						);
+						await host.request("approval/decide", {
+							commandId: uuid7(), sessionId, approvalId,
+							choiceId: strField(choice, "choiceId"), requirementId,
+						}, { ms: HOST_RPC_TIMEOUT_MS, label: "approval/decide" });
 						// Audit trail: unsandboxed runs auto-approve everything,
 						// so each automatic decision gets a visible activity row
 						// (label-only renders as a generic entry row).
@@ -1760,7 +1878,7 @@ export function streamMuseMsp(
 					await host.request("approval/decide", {
 						commandId: uuid7(), sessionId, approvalId,
 						choiceId, requirementId,
-					});
+					}, { ms: HOST_RPC_TIMEOUT_MS, label: "approval/decide" });
 					bridge?.recordActivity({
 						label: `approved via Pi: ${strField(params, "toolName") || "tool"} (${choiceId})`,
 						cwd: streamCwd,
@@ -1785,6 +1903,10 @@ export function streamMuseMsp(
 			void run.finally(() => {
 				if (approvalsInFlight.get(flightKey) === run) approvalsInFlight.delete(flightKey);
 				approvalsCompleted.add(flightKey);
+			}).catch((error: unknown) => {
+				// Pi UI failures (dialog torn down mid-approval) must fail the
+				// turn, never escape as an unhandled rejection that kills Pi.
+				if (!settled) cancelTurn(`approval failed: ${error instanceof Error ? error.message : String(error)}`);
 			});
 		};
 
@@ -1798,7 +1920,7 @@ export function streamMuseMsp(
 				if (!bridge?.hasUI) {
 					await host.request("userInput/cancel", {
 						commandId: uuid7(), sessionId, userInputId, reason: "Pi has no interactive UI",
-					}).catch(() => undefined);
+					}, { ms: HOST_RPC_TIMEOUT_MS, label: "userInput/cancel" }).catch(() => undefined);
 					cancelTurn("Muse asked a clarifying question; answer it in chat and retry");
 					return;
 				}
@@ -1822,7 +1944,7 @@ export function streamMuseMsp(
 							await host.request("userInput/clarify", {
 								commandId: uuid7(), sessionId, userInputId,
 								clarification: { format: "text", content: content.slice(0, 500) },
-							});
+							}, { ms: HOST_RPC_TIMEOUT_MS, label: "userInput/clarify" });
 							return;
 						}
 						answers.push({ questionId, selectedLabel: selected });
@@ -1835,12 +1957,12 @@ export function streamMuseMsp(
 							: { questionId, freeText: value.slice(0, 500) });
 					}
 				}
-				await host.request("userInput/answer", { commandId: uuid7(), sessionId, userInputId, answers });
+				await host.request("userInput/answer", { commandId: uuid7(), sessionId, userInputId, answers }, { ms: HOST_RPC_TIMEOUT_MS, label: "userInput/answer" });
 			})().catch(async (error) => {
 				if (settled) return;
 				await host.request("userInput/cancel", {
 					commandId: uuid7(), sessionId, userInputId, reason: error instanceof Error ? error.message : String(error),
-				}).catch(() => undefined);
+				}, { ms: HOST_RPC_TIMEOUT_MS, label: "userInput/cancel" }).catch(() => undefined);
 				cancelTurn("Muse clarification was cancelled");
 			});
 		};
@@ -1863,10 +1985,11 @@ export function streamMuseMsp(
 				];
 			}
 
-			const cwd = process.cwd();
-			const bareModel = model.id.includes("/") ? model.id.split("/").slice(1).join("/") : model.id;
+			const cwd = sessionCwd();
+			const bareModel = bareModelId(model.id);
 			liveKeyStr = chatKey(cwd, bareModel, context.messages);
 			let existing = lives.get(liveKeyStr) ?? null;
+			let resumePending = 0;
 			if (!existing) {
 				// A previous Pi process may have left a live Muse session behind.
 				// Adopt it only when this Pi conversation extends the exact
@@ -1884,10 +2007,23 @@ export function streamMuseMsp(
 				) {
 					const resumed = await resumePersistedSession(persisted);
 					if (resumed) {
-						debugLog(`adopted persisted session ${resumed.sessionId}`);
-						existing = resumed;
+						debugLog(`adopted persisted session ${resumed.live.sessionId}`);
+						existing = resumed.live;
+						resumePending = resumed.pending;
 					} else {
 						removePersistedSession(liveKeyStr);
+					}
+				}
+			}
+			if (!existing) {
+				// Mid-chat /model switch: move the same conversation's session
+				// to the new model instead of replaying full history.
+				const candidate = crossModelCandidate(context, cwd, bareModel, sandboxed);
+				if (candidate) {
+					const switched = await switchSessionModel(candidate, bareModel);
+					if (switched) {
+						existing = switched.live;
+						resumePending = switched.pending;
 					}
 				}
 			}
@@ -1946,12 +2082,29 @@ export function streamMuseMsp(
 						bridge?.ui.setWorkingMessage(`Muse ${activityLabel(item, kind)}`);
 					}
 				}),
+				host.onNotification("item/updated", (params) => {
+					if (params["sessionId"] !== mySession || settled) return;
+					const item = params["item"] as Record<string, unknown> | undefined;
+					if (!item || item["turnId"] !== turnId) return;
+					rememberItemTarget(mySession, item);
+					const itemId = strField(item, "itemId");
+					if (item["kind"] === "toolCall" && item["background"] === true && !backgroundNoted.has(itemId)) {
+						backgroundNoted.add(itemId);
+						bridge?.recordActivity({
+							label: `backgrounded: ${activityLabel(item, "toolCall")}`,
+							cwd,
+							itemId,
+							failed: false,
+						});
+					}
+				}),
 				host.onNotification("item/completed", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
 					const item = params["item"] as Record<string, unknown> | undefined;
 					if (!item || item["turnId"] !== turnId) return;
 					const kind = item["kind"];
 					const text = itemText(item);
+					rememberItemTarget(mySession, item);
 					if (kind === "agentMessage") {
 						// Full snapshot: emit only the tail not already streamed
 						// via item/delta (missing deltas => whole text, the
@@ -1991,6 +2144,16 @@ export function streamMuseMsp(
 							itemId: strField(item, "itemId"),
 							failed: item["status"] !== undefined && item["status"] !== "completed",
 						});
+					} else if (kind !== "userMessage") {
+						// The schema requires unknown kinds to render generically;
+						// only our own user echo (which we already show) is skipped.
+						bridge?.ui.setWorkingMessage();
+						bridge?.recordActivity({
+							label: `${String(kind) || "item"}: ${oneLine(strField(item, "fallbackText")) || strField(item, "itemId") || "update"}`,
+							cwd,
+							itemId: strField(item, "itemId"),
+							failed: item["status"] !== undefined && item["status"] !== "completed",
+						});
 					}
 				}),
 				host.onNotification("session/tokenUsage", (params) => {
@@ -2017,6 +2180,10 @@ export function streamMuseMsp(
 						return;
 					}
 					if (params["turnId"] !== turnId) return;
+					// Terminal usage is authoritative: tokenUsage notifications
+					// may have been lost with a dying projector.
+					applyTokenUsage(output, params["usage"]);
+					if (model) calculateCost(model, output.usage);
 					if (params["terminal"] === "failed") {
 						const error = params["error"] as Record<string, unknown> | undefined;
 						const message = String(error?.["message"] ?? params["reason"] ?? "Muse turn failed");
@@ -2026,16 +2193,85 @@ export function streamMuseMsp(
 							return;
 						}
 						finish("error", message);
-					} else {
+					} else if (params["terminal"] === "completed" || params["terminal"] === undefined) {
 						keepLive = !sentImages || sparkUsesMeta(bareModel);
 						finish("stop");
+					} else if (params["terminal"] === "cancelled") {
+						// Our own abort settles first, so this is server-initiated.
+						finish("aborted", String(params["reason"] ?? "Muse turn was cancelled"));
+					} else {
+						finish("error", `Muse turn ended with unknown terminal "${String(params["terminal"])}"${params["reason"] ? `: ${String(params["reason"])}` : ""}`);
 					}
+				}),
+				host.onNotification("turn/retryScheduled", (params) => {
+					if (params["sessionId"] !== mySession || settled) return;
+					if (params["turnId"] !== undefined && params["turnId"] !== turnId) return;
+					const attempt = typeof params["attempt"] === "number" ? params["attempt"] : "?";
+					const maxAttempts = typeof params["maxAttempts"] === "number" ? params["maxAttempts"] : "?";
+					const delayMs = typeof params["retryDelayMs"] === "number" ? params["retryDelayMs"] : undefined;
+					const when = delayMs === undefined ? "shortly" : `in ${(delayMs / 1000).toFixed(delayMs < 10000 ? 1 : 0)}s`;
+					append("thinking", `[muse-msp: attempt ${attempt}/${maxAttempts} failed (${strField(params, "reason") || "transient error"}); retrying ${when}]\n`);
 				}),
 				host.onNotification("view/gap", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
 					debugLog("view/gap; will salvage from session log if the turn already completed");
 				}),
+				host.onNotification("session/todoListChanged", (params) => {
+					if (params["sessionId"] !== mySession || settled) return;
+					const items = Array.isArray(params["items"])
+						? (params["items"] as Array<Record<string, unknown>>)
+						: [];
+					if (items.length === 0) return;
+					const done = items.filter(
+						(item) => item["status"] === "completed" || item["status"] === "cancelled",
+					).length;
+					const active = items.find((item) => item["status"] === "inProgress");
+					const activeText = active ? strField(active, "activeForm") || strField(active, "text") : "";
+					bridge?.ui.setWorkingMessage(
+						`Muse todos ${done}/${items.length}${activeText ? `: ${oneLine(activeText, 100)}` : ""}`,
+					);
+					if (!todoCompleteNoted && done === items.length) {
+						todoCompleteNoted = true;
+						append("thinking", `[muse-msp: todos complete (${done}/${items.length})]\n`);
+					}
+				}),
+				host.onNotification("session/contextUsage", (params) => {
+					if (params["sessionId"] !== mySession || settled) return;
+					const pressure = strField(params, "pressure");
+					if (pressure !== "warning" && pressure !== "blocked") return;
+					if (pressure === lastPressure) return;
+					lastPressure = pressure;
+					const used = typeof params["usedTokens"] === "number" ? params["usedTokens"] : "?";
+					const window = typeof params["windowTokens"] === "number" ? params["windowTokens"] : "?";
+					append("thinking", `[muse-msp: context pressure ${pressure}: ${used}/${window} tokens]\n`);
+				}),
+				host.onNotification("session/viewHealthChanged", (params) => {
+					if (params["sessionId"] !== mySession || settled) return;
+					if (params["health"] !== "unavailable" || viewUnhealthy) return;
+					viewUnhealthy = true;
+					append("thinking", `[muse-msp: view projector reported unavailable (${strField(params, "noneReason") || "unknown reason"}); salvaging from the durable log]\n`);
+					salvage();
+				}),
 			);
+
+			if (resumePending > 0 && sessionId) {
+				// Adopted sessions may carry requests raised while detached;
+				// their re-issued notifications raced our handlers, so pull.
+				const sid = sessionId;
+				void host.request("approval/listPending", { sessionId: sid }, { ms: HOST_RPC_TIMEOUT_MS, label: "approval/listPending" })
+					.then((listed) => {
+						if (settled || sid !== sessionId) return;
+						const rows = Array.isArray(listed["approvals"])
+							? (listed["approvals"] as Array<Record<string, unknown>>)
+							: [];
+						for (const row of rows) handleApproval(row);
+						const userInputs = Array.isArray(listed["userInputs"])
+							? (listed["userInputs"] as Array<Record<string, unknown>>)
+							: [];
+						for (const row of userInputs) handleUserInput(row);
+					})
+					.catch(() => undefined);
+			}
 
 			const abort = () => {
 				if (settled || !sessionId) return;
@@ -2094,8 +2330,11 @@ export function streamMuseMsp(
 							output.content.map((block) => block.type === "text" ? block.text : "").join("\n") });
 						sentImages = parts.some((part) => part["type"] === "image");
 						salvageAfterMs = Date.now();
+						viewUnhealthy = false;
+						todoCompleteNoted = false;
+						lastPressure = "";
 						mediaRetry = "done";
-						const retryResult = await host.request("turn/start", turnParams());
+						const retryResult = await startTurn();
 						if (settled) return;
 						turnId = String(retryResult["turnId"] ?? "");
 						if (!turnId) throw new Error("Muse MSP vision retry returned no turnId");
@@ -2112,11 +2351,7 @@ export function streamMuseMsp(
 				const params = turnParams();
 				const provisionalTurnId = turnId;
 				try {
-					return await withTimeout(
-						host.request("turn/start", params),
-						TURN_START_ACK_TIMEOUT_MS,
-						"turn/start acknowledgement",
-					);
+					return await host.request("turn/start", params, { ms: TURN_START_ACK_TIMEOUT_MS, label: "turn/start acknowledgement" });
 				} catch (error) {
 					if (
 						error instanceof Error &&
@@ -2155,8 +2390,10 @@ export function streamMuseMsp(
 			if (!turnId) throw new Error("Muse MSP turn/start returned no turnId");
 			// Publish the running turn so native Pi steering can exact-target it
 			// via turn/steer. finish() (above) revokes it on settle, so a
-			// steer can never land on a terminal or cancelled turn.
-			if (liveKeyStr && sessionId) {
+			// steer can never land on a terminal or cancelled turn. The ack
+			// can land after an early terminal already settled the turn, in
+			// which case publishing would leak a stale steer/fork target.
+			if (liveKeyStr && sessionId && !settled) {
 				const entry: ActiveTurn = {
 					liveKey: liveKeyStr,
 					cwd,
@@ -2211,11 +2448,7 @@ export function streamMuseMsp(
 					for (const row of pendingApprovalsFromLog(sid, salvageAfterMs)) handleApproval(row);
 					if (!listPendingInFlight) {
 						listPendingInFlight = true;
-						void withTimeout(
-							host.request("approval/listPending", { sessionId: sid }),
-							1_500,
-							"approval/listPending",
-						)
+						void host.request("approval/listPending", { sessionId: sid }, { ms: 1_500, label: "approval/listPending" })
 							.then((listed) => {
 								if (settled) return;
 								const rows = Array.isArray(listed["approvals"])
@@ -2238,7 +2471,9 @@ export function streamMuseMsp(
 				// would cry "projector died" on every slow turn. Wait out the
 				// grace so only a truly missing notification abandons the turn
 				// below (progress and approvals above keep flowing meanwhile).
-				if (failedReason || recovered) {
+				// A server-confirmed dead projector skips the grace: the live
+				// notification isn't merely slow, it's never coming.
+				if (!viewUnhealthy && (failedReason || recovered)) {
 					if (!terminalFirstSeenMs) {
 						terminalFirstSeenMs = Date.now();
 						return;
@@ -2282,6 +2517,10 @@ export function streamMuseMsp(
 			finish(options?.signal?.aborted ? "aborted" : "error", error instanceof Error ? error.message : String(error));
 		}
 		await finished;
+	}).catch((error: unknown) => {
+		// Unreachable insurance: the body funnels everything to finish(), but
+		// an extension must never take its host down with an unhandled rejection.
+		debugLog(`turn body escaped: ${error instanceof Error ? error.message : String(error)}`);
 	});
 
 	return stream;
@@ -2320,11 +2559,19 @@ function modelDefinition(id: string, name: string) {
 	};
 }
 
-async function refreshMuseMspModels() {
+/** Posture for model refresh: reuse any existing host (listing models must
+ * never respawn — that would kill live sessions); otherwise prefer what is
+ * actually known (env, then the last turn's posture) and default to
+ * sandboxed, since CLI flags may not have landed yet at startup refresh. */
+function refreshPosture(): boolean {
+	return host.currentSandboxed() ?? (envSandboxed() || lastMspSandboxed) ?? true;
+}
+
+async function refreshMuseMspModels(sandboxed: boolean) {
 	const models = FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name));
 	try {
-		await host.ensure(false);
-		const result = await host.request("model/list", {});
+		await host.ensure(sandboxed);
+		const result = await host.request("model/list", {}, { ms: HOST_RPC_TIMEOUT_MS, label: "model/list" });
 		const rows = Array.isArray(result["models"]) ? (result["models"] as Array<Record<string, unknown>>) : [];
 		if (rows.length > 0) {
 			const live = rows.map((row) =>
@@ -2387,6 +2634,58 @@ function piToolActivity(activity: MuseActivity, expanded: boolean) {
 	return component;
 }
 
+/** Resolve an item-id prefix to a drill-down target, or an error message. */
+function findItemTarget(prefix: string, need: "subagentId" | "outputRefId"): [string, ItemTarget] | string {
+	if (!prefix) return "muse-msp: pass an item id prefix (see the activity row)";
+	const matches = [...itemTargets.entries()].filter(([itemId]) => itemId.startsWith(prefix));
+	if (matches.length === 0) return `muse-msp: no recorded item starts with ${prefix}`;
+	if (matches.length > 1) {
+		return `muse-msp: prefix ${prefix} is ambiguous (${matches.map(([itemId]) => shortId(itemId)).join(", ")})`;
+	}
+	const [itemId, target] = matches[0]!;
+	if (!target[need]) {
+		return `muse-msp: item ${shortId(itemId)} has no ${need === "subagentId" ? "subagent result" : "stored output"}`;
+	}
+	return [itemId, target];
+}
+
+/** Server-side session inventory (id to model/updated), or null when the list
+ * call fails. Never throws. */
+async function mspServerSessions(
+	sandboxed: boolean,
+	workspaceRoot?: string,
+): Promise<Map<string, { model: string; updatedAt: string }> | null> {
+	try {
+		await host.ensure(sandboxed);
+		const result = await host.request("session/list", { limit: 200, ...(workspaceRoot ? { workspaceRoot } : {}) }, { ms: HOST_RPC_TIMEOUT_MS, label: "session/list" });
+		const rows = Array.isArray(result["sessions"])
+			? (result["sessions"] as Array<Record<string, unknown>>)
+			: [];
+		const out = new Map<string, { model: string; updatedAt: string }>();
+		for (const row of rows) {
+			const id = strField(row, "sessionId");
+			if (id) out.set(id, { model: strField(row, "modelId"), updatedAt: strField(row, "updatedAt") });
+		}
+		return out;
+	} catch {
+		return null;
+	}
+}
+
+/** One-line skill inventory for doctor ("-" without a session, "?" on failure). Never throws. */
+async function mspSkillSummary(preferredSessionId?: string): Promise<string> {
+	const sessionId = preferredSessionId ?? latestOriginSessionId() ?? [...lives.values()][0]?.sessionId;
+	if (!sessionId) return "-";
+	try {
+		const result = await host.request("skill/list", { sessionId }, { ms: HOST_RPC_TIMEOUT_MS, label: "skill/list" });
+		const rows = Array.isArray(result["skills"]) ? (result["skills"] as Array<Record<string, unknown>>) : [];
+		const names = rows.map((row) => strField(row, "selector")).filter(Boolean);
+		return `${names.length}${names.length ? `(${names.slice(0, 8).join(",")}${names.length > 8 ? ",…" : ""})` : ""}`;
+	} catch {
+		return "?";
+	}
+}
+
 export default function museMsp(pi: ExtensionAPI): void {
 	pi.registerEntryRenderer<MuseActivity>("muse-msp-activity", (entry, { expanded }, theme) => {
 		const activity = entry.data;
@@ -2403,11 +2702,17 @@ export default function museMsp(pi: ExtensionAPI): void {
 		return box;
 	});
 	const bridgeFor = (model: Model<Api>, context: Context) =>
-		uiBridges.get(chatKey(process.cwd(), bareModelId(model.id), context.messages));
+		uiBridges.get(chatKey(sessionCwd(), bareModelId(model.id), context.messages));
+	// Flags are applied by turn time, so each turn records the authoritative
+	// posture for later refreshes (see refreshPosture).
+	const turnSandboxed = (): boolean => {
+		lastMspSandboxed = mspSandboxed(pi);
+		return lastMspSandboxed;
+	};
 	const stream = (model: Model<Api>, context: Context, options?: StreamOptions) =>
-		streamMuseMsp(model, context, options, mspSandboxed(pi), bridgeFor(model, context));
+		streamMuseMsp(model, context, options, turnSandboxed(), bridgeFor(model, context));
 	const streamSimple = (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
-		streamMuseMsp(model, context, options, mspSandboxed(pi), bridgeFor(model, context));
+		streamMuseMsp(model, context, options, turnSandboxed(), bridgeFor(model, context));
 
 	registerApiProvider({ api: MSP_API, stream, streamSimple }, API_PROVIDER_SOURCE);
 	pi.registerFlag("muse-msp-sandboxed", {
@@ -2421,7 +2726,7 @@ export default function museMsp(pi: ExtensionAPI): void {
 		apiKey: "muse-msp-local",
 		api: MSP_API,
 		models: FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name)),
-		refreshModels: refreshMuseMspModels,
+		refreshModels: () => refreshMuseMspModels(refreshPosture()),
 		streamSimple,
 	});
 	// Capture the native UI against the same stable chat key used by the
@@ -2434,7 +2739,7 @@ export default function museMsp(pi: ExtensionAPI): void {
 		// LLM Messages. Normalize here so this key exactly matches bridgeFor()
 		// and never assumes every raw AgentMessage has a content array.
 		const messages = convertToLlm(event.messages) as Context["messages"];
-		uiBridges.set(chatKey(ctx.cwd, bareModelId(ctx.model.id), messages), {
+		uiBridges.set(chatKey(sessionCwd(), bareModelId(ctx.model.id), messages), {
 			ui: ctx.ui,
 			hasUI: ctx.hasUI,
 			recordActivity: (activity) => pi.appendEntry("muse-msp-activity", activity),
@@ -2458,7 +2763,7 @@ export default function museMsp(pi: ExtensionAPI): void {
 			return { action: "continue" };
 		}
 		const outcome = await steerRunningTurn(
-			ctx.cwd,
+			sessionCwd(),
 			bareModelId(ctx.model.id),
 			event.text,
 			event.images,
@@ -2470,13 +2775,20 @@ export default function museMsp(pi: ExtensionAPI): void {
 		return { action: "handled" };
 	});
 	pi.registerCommand("muse-msp-doctor", {
-		description: "Check the Muse MSP host (binary, handshake, schema fingerprint)",
+		description: "Check the Muse MSP host (binary, handshake, schema fingerprint, loaded skills)",
 		handler: async (_args, ctx) => {
 			try {
 				await host.ensure(mspSandboxed(pi));
 				const fingerprint = host.fingerprintInfo();
+				// Prefer this chat's live session for the skill inventory; the
+				// origin file is process-global and may belong to another chat.
+				const chatModel = ctx.model?.provider === PROVIDER_ID ? bareModelId(ctx.model.id) : undefined;
+				const chatSession = chatModel
+					? [...lives.values()].find((live) => live.cwd === sessionCwd() && live.model === chatModel)?.sessionId
+					: undefined;
+				const skills = await mspSkillSummary(chatSession);
 				ctx.ui.notify(
-					`muse-msp ok: host running (sandboxed=${mspSandboxed(pi)}, fingerprint=${fingerprint ?? "unknown"}${MSP_FINGERPRINT && fingerprint && fingerprint !== MSP_FINGERPRINT ? " — MISMATCH vs PI_MUSE_MSP_FINGERPRINT, update extension" : ""}, liveSessions=${lives.size}, persistedSessions=${loadPersistedSessions().size})`,
+					`muse-msp ok: host running (sandboxed=${mspSandboxed(pi)}, fingerprint=${fingerprint ?? "unknown"}${MSP_FINGERPRINT && fingerprint && fingerprint !== MSP_FINGERPRINT ? " — MISMATCH vs PI_MUSE_MSP_FINGERPRINT, update extension" : ""}, liveSessions=${lives.size}, persistedSessions=${loadPersistedSessions().size}, skills=${skills})`,
 					"info",
 				);
 			} catch (error) {
@@ -2506,10 +2818,116 @@ export default function museMsp(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Recovered completed Muse answer from ${sessionId}`, "info");
 		},
 	});
+	pi.registerCommand("muse-msp-subagent", {
+		description: "Show a finished subagent's result (pass an item id prefix from its activity row)",
+		handler: async (args, ctx) => {
+			const target = findItemTarget(args.trim(), "subagentId");
+			if (typeof target === "string") {
+				ctx.ui.notify(target, "error");
+				return;
+			}
+			const [itemId, found] = target;
+			try {
+				await host.ensure(mspSandboxed(pi));
+				const result = await host.request("subagent/readResult", {
+					commandId: uuid7(),
+					sessionId: found.sessionId,
+					subagentId: found.subagentId!,
+				}, { ms: HOST_RPC_TIMEOUT_MS, label: "subagent/readResult" });
+				const summary = strField(result, "summary");
+				const text = strField(result, "text");
+				const body = [summary, text].filter(Boolean).join("\n\n") || "(no result text)";
+				pi.sendMessage({
+					customType: "muse-msp-subagent",
+					content: body,
+					display: true,
+					details: { itemId, subagentId: found.subagentId },
+				});
+				ctx.ui.notify(`subagent ${shortId(itemId)}: ${oneLine(summary || text, 120) || "result posted"}`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+	pi.registerCommand("muse-msp-output", {
+		description: "Show a tool's stored output (pass an item id prefix from its activity row)",
+		handler: async (args, ctx) => {
+			const target = findItemTarget(args.trim(), "outputRefId");
+			if (typeof target === "string") {
+				ctx.ui.notify(target, "error");
+				return;
+			}
+			const [itemId, found] = target;
+			try {
+				await host.ensure(mspSandboxed(pi));
+				const result = await host.request("item/readOutput", {
+					sessionId: found.sessionId,
+					itemId,
+					outputRef: found.outputRefId,
+					lengthBytes: 32768,
+				}, { ms: HOST_RPC_TIMEOUT_MS, label: "item/readOutput" });
+				const content = strField(result, "content");
+				pi.sendMessage({
+					customType: "muse-msp-output",
+					content: content || "(no stored output)",
+					display: true,
+					details: { itemId, mediaType: strField(result, "mediaType") },
+				});
+				ctx.ui.notify(
+					`output ${shortId(itemId)}: ${content.length} chars${result["eof"] === false ? " (truncated, first page)" : ""}`,
+					"info",
+				);
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+	pi.registerCommand("muse-msp-fork", {
+		description: "Fork this chat's live Muse session (whole history) and continue on the fork",
+		handler: async (_args, ctx) => {
+			if (!ctx.model || ctx.model.provider !== PROVIDER_ID) {
+				ctx.ui.notify("muse-msp: no Muse session for this chat", "error");
+				return;
+			}
+			const cwd = sessionCwd();
+			const model = bareModelId(ctx.model.id);
+			if ([...activeTurns.values()].some((turn) => turn.cwd === cwd && turn.model === model)) {
+				ctx.ui.notify("muse-msp: a turn is in flight; wait for it to finish before forking", "error");
+				return;
+			}
+			const matches = [...lives.entries()].filter(([, live]) => live.cwd === cwd && live.model === model);
+			if (matches.length === 0) {
+				ctx.ui.notify("muse-msp: no live session for this chat to fork", "error");
+				return;
+			}
+			if (matches.length > 1) {
+				ctx.ui.notify("muse-msp: several live sessions match this directory; fork needs an unambiguous target", "error");
+				return;
+			}
+			const [key, live] = matches[0]!;
+			try {
+				await host.ensure(live.sandboxed);
+				const result = await host.request("session/fork", { commandId: uuid7(), sessionId: live.sessionId }, { ms: HOST_RPC_TIMEOUT_MS, label: "session/fork" });
+				const session = result["session"] as Record<string, unknown> | undefined;
+				const id = session ? String(session["sessionId"] ?? "") : "";
+				if (!id) throw new Error("muse fork returned no session");
+				const from = live.sessionId;
+				attached.add(id);
+				live.sessionId = id;
+				lives.set(key, live);
+				savePersistedSessions();
+				writeOriginFile({ sessionId: id, cwd: live.cwd, model: live.model, sandboxed: live.sandboxed });
+				ctx.ui.notify(`muse-msp: forked ${shortId(from)} → ${shortId(id)} (whole history); this chat continues on the fork`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
 	pi.registerCommand("muse-msp-sessions", {
 		description: "List Muse MSP sessions kept for Pi chats (pass 'prune' to drop expired or dead entries)",
 		handler: async (args, ctx) => {
 			const now = Date.now();
+			const cwd = sessionCwd();
 			const rows = new Map<
 				string,
 				{ sessionId: string; cwd: string; model: string; sandboxed: boolean; messageCount: number; age: string; live: boolean }
@@ -2537,6 +2955,9 @@ export default function museMsp(pi: ExtensionAPI): void {
 				});
 			}
 			if (args.trim().toLowerCase() === "prune") {
+				// One session/list join beats N resume probes; per-row probing
+				// remains as the fallback when the list call fails.
+				const listed = await mspServerSessions(mspSandboxed(pi));
 				let dropped = 0;
 				let kept = 0;
 				for (const [key, row] of rows) {
@@ -2544,16 +2965,17 @@ export default function museMsp(pi: ExtensionAPI): void {
 						kept++;
 						continue;
 					}
-					let dead = false;
-					try {
-						await host.ensure(row.sandboxed);
-						await withTimeout(
-							host.request("session/resume", { commandId: uuid7(), sessionId: row.sessionId }),
-							5_000,
-							"session/resume",
-						);
-					} catch {
-						dead = true;
+					let dead: boolean;
+					if (listed) {
+						dead = !listed.has(row.sessionId);
+					} else {
+						dead = false;
+						try {
+							await host.ensure(row.sandboxed);
+							await host.request("session/resume", { commandId: uuid7(), sessionId: row.sessionId }, { ms: HOST_RPC_TIMEOUT_MS, label: "session/resume" });
+						} catch {
+							dead = true;
+						}
 					}
 					if (dead) {
 						removePersistedSession(key);
@@ -2567,11 +2989,25 @@ export default function museMsp(pi: ExtensionAPI): void {
 				ctx.ui.notify("muse-msp: no sessions (live or persisted)", "info");
 				return;
 			}
+			const server = await mspServerSessions(mspSandboxed(pi), cwd);
+			const known = new Set([...rows.values()].map((row) => row.sessionId));
 			const lines = [...rows.values()].map(
 				(row) =>
 					`${row.live ? "*" : " "} ${shortId(row.sessionId)} ${row.model || "?"} @ ${row.cwd || "?"} ` +
-					`(msgs=${row.messageCount}, age=${row.age}${row.sandboxed ? ", sandboxed" : ""})`,
+					`(msgs=${row.messageCount}, age=${row.age}${row.sandboxed ? ", sandboxed" : ""}` +
+					`${server && !server.has(row.sessionId) ? ", not on server" : ""})`,
 			);
+			if (server) {
+				for (const [id, meta] of server) {
+					if (known.has(id)) continue;
+					const ms = Date.parse(meta.updatedAt);
+					lines.push(
+						`  ${shortId(id)} ${meta.model || "?"} (server only${Number.isFinite(ms) ? `, updated ${ageLabel(now - ms)} ago` : ""})`,
+					);
+				}
+			} else {
+				lines.push("(server session list unavailable)");
+			}
 			ctx.ui.notify(`muse-msp sessions (*live):\n${lines.join("\n")}`, "info");
 		},
 	});

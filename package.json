@@ -1,6 +1,6 @@
 {
   "name": "pi-muse-msp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Muse MSP provider extension for Pi",
   "license": "MIT",
   "repository": {
@@ -8,13 +8,17 @@
     "url": "git+https://github.com/jwise7/pi-muse-msp.git"
   },
   "homepage": "https://github.com/jwise7/pi-muse-msp",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
   "files": ["extensions/", "docs/", "README.md", "CHANGELOG.md", "LICENSE"],
   "scripts": {
     "test": "python3 tests/muse-msp/regressions.py"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.85.1",
-    "@earendil-works/pi-ai": "^0.85.1",
-    "@earendil-works/pi-tui": "^0.85.1"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
   }
 }

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-import json, os, pathlib, select, subprocess, tempfile, time
+import json, pathlib, sys, time
 
-root = pathlib.Path(tempfile.mkdtemp(prefix="pi-msp-vision.", dir="/tmp"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import rpc_harness as harness
+
+root = harness.mkdtemp("pi-msp-vision.")
 log = root / "msp.log"
 sid = "00000000-0000-7000-8000-000000000001"
 jsonl = root / ".local/share/muse/sessions/1970/01/01" / sid / "session.jsonl"
@@ -13,61 +16,11 @@ png.write_bytes(
         "0000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082"
     )
 )
-env = os.environ | {
-    "HOME": str(root),
-    "PI_MUSE_BINARY": str(pathlib.Path(__file__).with_name("fake-host.py")),
-    "FAKE_MSP_LOG": str(log),
-    "FAKE_HANG": "1",
-}
-proc = subprocess.Popen(
-    [
-        "pi",
-        "--mode",
-        "rpc",
-        "--no-session",
-        "--no-extensions",
-        "-e",
-        str(pathlib.Path(__file__).parents[2] / "extensions" / "muse-msp.ts"),
-        "--provider",
-        "muse-msp",
-        "--model",
-        "muse-spark-1.3",
-        "--no-tools",
-    ],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
-    env=env,
-)
-
-
-def send(value):
-    proc.stdin.write(json.dumps(value) + "\n")
-    proc.stdin.flush()
-
-
-def read_until(predicate, timeout=20):
-    deadline = time.time() + timeout
-    seen = []
-    while time.time() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], max(0, deadline - time.time()))
-        if not ready:
-            break
-        line = proc.stdout.readline()
-        if not line:
-            break
-        event = json.loads(line)
-        seen.append(event)
-        if predicate(event, seen):
-            return seen
-    err = proc.stderr.read() if proc.poll() is not None else ""
-    raise AssertionError(f"timed out; events={seen[-12:]}; stderr={err}")
-
+proc = harness.spawn(root, log, extra_env={"FAKE_HANG": "1"})
 
 try:
-    send({"id": "start", "type": "prompt", "message": "look at the screenshot"})
-    read_until(lambda _, seen: any(item.get("type") == "turn_start" for item in seen), timeout=8)
+    harness.send(proc, {"id": "start", "type": "prompt", "message": "look at the screenshot"})
+    harness.read_until(proc, lambda _, seen: any(item.get("type") == "turn_start" for item in seen), timeout=8)
     now_us = int(time.time() * 1_000_000)
     jsonl.write_text(
         "\n".join(
@@ -109,7 +62,7 @@ try:
         )
         + "\n"
     )
-    events = read_until(lambda event, _: event.get("type") == "agent_end", timeout=16)
+    events = harness.read_until(proc, lambda event, _: event.get("type") == "agent_end", timeout=16)
     ame = [event.get("assistantMessageEvent") or {} for event in events]
     text = "".join(e.get("delta", "") for e in ame if e.get("type") == "text_delta")
     thinking = "".join(e.get("delta", "") for e in ame if e.get("type") == "thinking_delta")
@@ -120,8 +73,4 @@ try:
     assert "cannot retain tool-read images" in thinking, thinking
     print("PASS: retained-media failure retried with attached images")
 finally:
-    proc.terminate()
-    try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    harness.stop(proc)

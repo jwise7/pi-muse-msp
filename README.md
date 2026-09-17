@@ -6,7 +6,11 @@ Long-lived host, true streaming, live token usage, image input. One MSP session 
 
 ## Install
 
-Copy `extensions/muse-msp.ts` into your Pi extensions directory (`~/.pi/agent/extensions/`), then `/reload` or restart Pi.
+```sh
+pi install git:github.com/jwise7/pi-muse-msp@v0.2.0
+```
+
+then `/reload` or restart Pi. Or copy `extensions/muse-msp.ts` into your Pi extensions directory (`~/.pi/agent/extensions/`) manually.
 
 Requires the `muse` CLI on `PATH` (override with `PI_MUSE_BINARY`).
 
@@ -35,8 +39,11 @@ If you run untrusted tasks, enable the sandbox (`PI_MUSE_MSP_SANDBOXED=1` or `--
 
 | Command | Meaning |
 | ------- | ------- |
-| `/muse-msp-doctor` | Check the host: binary, handshake, schema fingerprint, live/persisted session counts |
-| `/muse-msp-sessions` | List Muse sessions kept for Pi chats (`*` = live); pass `prune` to drop expired or dead entries |
+| `/muse-msp-doctor` | Check the host: binary, handshake, schema fingerprint, live/persisted session counts, loaded skills |
+| `/muse-msp-sessions` | List Muse sessions kept for Pi chats (`*` = live) joined with the server inventory; pass `prune` to drop expired or dead entries |
+| `/muse-msp-fork` | Fork this chat's live Muse session (whole history) and continue on the fork |
+| `/muse-msp-subagent` | Show a finished subagent's result (pass an item id prefix from its activity row) |
+| `/muse-msp-output` | Show a tool's stored output (pass an item id prefix from its activity row) |
 | `/muse-msp-recover-completed` | Recover the newest completed plaintext answer from a Muse durable session log (defaults to the origin session) |
 
 ## Test
@@ -47,7 +54,7 @@ Requires the `pi` CLI on `PATH`.
 python3 tests/muse-msp/regressions.py
 ```
 
-Isolated fake-host checks: version sync, event recovery, bounded retry, duplicate/resolved approvals, JSONL tool-image recovery, vision retry, salvage-fresh, mid-turn steer, headless clarification cancel, persisted cross-process resume, compaction context, host generation isolation, pre-ack durable recovery. No live Muse sessions touched. Four machine-local suites (proposals inbox, session context, memory propose, ask/approve doc conformance) run when their non-repo dependencies are installed and otherwise print SKIP. See [docs/STEERING.md](docs/STEERING.md) for the live steering model.
+Isolated fake-host checks: version sync, event recovery, bounded retry, duplicate/resolved approvals, JSONL tool-image recovery, vision retry, salvage-fresh, mid-turn steer, headless clarification cancel, hung-RPC timeouts, persisted cross-process resume, compaction context, host generation isolation, pre-ack durable recovery, terminal/usage/retry lifecycle, live model switch, todo/context/health subscribers, subagent drill-down, session fork. No live Muse sessions touched. Four machine-local suites (proposals inbox, session context, memory propose, ask/approve doc conformance) run when their non-repo dependencies are installed and otherwise print SKIP. See [docs/STEERING.md](docs/STEERING.md) for the live steering model.
 
 ## Pinning
 
