@@ -8,6 +8,10 @@
     "url": "git+https://github.com/jwise7/pi-muse-msp.git"
   },
   "homepage": "https://github.com/jwise7/pi-muse-msp",
+  "files": ["extensions/", "docs/", "README.md", "CHANGELOG.md", "LICENSE"],
+  "scripts": {
+    "test": "python3 tests/muse-msp/regressions.py"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^0.85.1",
     "@earendil-works/pi-ai": "^0.85.1",

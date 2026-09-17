@@ -60,6 +60,8 @@ function imageDigestOf(base64Data: string): string {
 
 /** Human-readable origin for an image ("..." when unknown). Never sent on the wire. */
 const imageSources = new Map<string, string>();
+/** Cap label memory: only recent attachments need human-readable names. */
+const IMAGE_SOURCES_MAX = 200;
 
 function imageLabel(image: MspImage): string {
 	return (
@@ -530,7 +532,14 @@ function userMessageParts(
 						: typeof record["path"] === "string" && record["path"]
 							? String(record["path"])
 							: undefined;
-				if (name) imageSources.set(imageDigestOf(image.base64Data), name);
+				if (name) {
+				imageSources.set(imageDigestOf(image.base64Data), name);
+				while (imageSources.size > IMAGE_SOURCES_MAX) {
+					const oldest = imageSources.keys().next();
+					if (oldest.done) break;
+					imageSources.delete(oldest.value);
+				}
+			}
 			}
 		}
 	}
@@ -962,13 +971,16 @@ function latestUserSuffix(messages: Context["messages"]): Context["messages"] | 
 function enqueueTurn<T>(key: string, fn: () => Promise<T>): Promise<T> {
 	const prior = turnChains.get(key) ?? Promise.resolve();
 	const run = prior.then(fn, fn);
-	turnChains.set(
-		key,
-		run.then(
-			() => undefined,
-			() => undefined,
-		),
+	const tail = run.then(
+		() => undefined,
+		() => undefined,
 	);
+	turnChains.set(key, tail);
+	// Evict idle chains so a long-lived process doesn't retain one entry per
+	// chat. A newer tail means another turn chained behind us: keep that one.
+	void tail.then(() => {
+		if (turnChains.get(key) === tail) turnChains.delete(key);
+	});
 	return run;
 }
 
@@ -1621,6 +1633,9 @@ export function streamMuseMsp(
 				savePersistedSessions();
 			} else if (liveKeyStr) {
 				lives.delete(liveKeyStr);
+				// The next turn's context event re-registers its bridge, so a
+				// dropped session can shed its UI entry instead of pinning it.
+				uiBridges.delete(liveKeyStr);
 				if (sessionId) attached.delete(sessionId);
 				// A session refused for reuse must not stay adoptable: the
 				// on-disk index would otherwise resurrect it on the next turn

@@ -23,11 +23,21 @@ Platform: macOS/Linux. Durable-log recovery reads Muse sessions under `~/.local/
 
 Model list is live from `model/list` with a static Spark fallback. Spark sessions start with `providerId: "meta"` so retained tool-read images keep working.
 
+To pin the fingerprint, copy the live value from `/muse-msp-doctor` into `PI_MUSE_MSP_FINGERPRINT`; future turns then warn if the host schema drifts.
+
 ## Security
 
 Defaults favor a trusted local machine: the host runs unsandboxed (`muse serve --disable-sandbox`) and tool approvals auto-approve (`allowAll`), with an `auto-approved: <tool>` activity row as the audit trail. A prompt-injected or malicious model output could therefore run arbitrary tools without asking.
 
 If you run untrusted tasks, enable the sandbox (`PI_MUSE_MSP_SANDBOXED=1` or `--muse-msp-sandboxed`), which serves with workspace trust and per-request approvals (still auto-decided first, Pi UI as fallback). Headless runs (`pi -p`) have no UI fallback: un-answerable approvals and clarifying questions fail the turn instead of asking.
+
+## Commands
+
+| Command | Meaning |
+| ------- | ------- |
+| `/muse-msp-doctor` | Check the host: binary, handshake, schema fingerprint, live/persisted session counts |
+| `/muse-msp-sessions` | List Muse sessions kept for Pi chats (`*` = live); pass `prune` to drop expired or dead entries |
+| `/muse-msp-recover-completed` | Recover the newest completed plaintext answer from a Muse durable session log (defaults to the origin session) |
 
 ## Test
 
