@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+Tested against Pi 0.85.1 (`pi-ai` / `pi-ai/compat` provider API).
+
+- Publish as `pi-muse-msp` on npm for installation with
+  `pi install npm:pi-muse-msp` and discovery in the Pi package catalog
+- Add npm author, issue tracker, public-access policy, and search metadata
+
 ## 0.2.0
 
 Tested against Pi 0.85.1 (`pi-ai` / `pi-ai/compat` provider API).

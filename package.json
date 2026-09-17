@@ -1,14 +1,21 @@
 {
   "name": "pi-muse-msp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Muse MSP provider extension for Pi",
+  "author": "Jesse Wise",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jwise7/pi-muse-msp.git"
   },
   "homepage": "https://github.com/jwise7/pi-muse-msp",
-  "keywords": ["pi-package"],
+  "bugs": {
+    "url": "https://github.com/jwise7/pi-muse-msp/issues"
+  },
+  "keywords": ["pi-package", "pi", "muse", "msp", "coding-agent"],
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
     "extensions": ["./extensions"]
   },

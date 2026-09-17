@@ -7,10 +7,16 @@ Long-lived host, true streaming, live token usage, image input. One MSP session 
 ## Install
 
 ```sh
-pi install git:github.com/jwise7/pi-muse-msp@v0.2.0
+pi install npm:pi-muse-msp
 ```
 
-then `/reload` or restart Pi. Or copy `extensions/muse-msp.ts` into your Pi extensions directory (`~/.pi/agent/extensions/`) manually.
+Then `/reload` or restart Pi. You can also install the pinned GitHub release:
+
+```sh
+pi install git:github.com/jwise7/pi-muse-msp@v0.2.1
+```
+
+Or copy `extensions/muse-msp.ts` into your Pi extensions directory (`~/.pi/agent/extensions/`) manually.
 
 Requires the `muse` CLI on `PATH` (override with `PI_MUSE_BINARY`).
 
