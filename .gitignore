@@ -1,4 +1,3 @@
 node_modules/
 *.log
 __pycache__/
-.msp-view-v1/

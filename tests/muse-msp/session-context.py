@@ -8,6 +8,9 @@ import tempfile
 
 here = pathlib.Path(__file__).resolve().parent
 helper = pathlib.Path.home() / ".config/muse/skills/pi-session-context/origin.mjs"
+if not helper.is_file():
+    print("SKIP: pi-session-context origin.mjs not installed")
+    raise SystemExit(0)
 agent_home = pathlib.Path(tempfile.mkdtemp(prefix="pi-origin-home.", dir="/tmp"))
 agent_dir = agent_home / ".pi" / "agent"
 agent_dir.mkdir(parents=True)
@@ -26,8 +29,10 @@ report = json.loads(r.stdout)
 assert report["runningUnderPi"] is False and report["sessionId"] is None, report
 assert report["cwd"] == str(agent_home.resolve()) and report["hermesStore"] is None, report
 
-# fixture origin under matching cwd: all fields surface
-origin = {"provider": "muse-msp", "extensionVersion": "0.1.0",
+# fixture origin under matching cwd: all fields surface. The version is arbitrary
+# test data (the helper only echoes it), deliberately not the repo release
+# version, so bumps never require touching this fixture.
+origin = {"provider": "muse-msp", "extensionVersion": "9.9.9-fixture",
           "sessionId": "s-123", "cwd": str(agent_home.resolve()),
           "model": "muse-spark-1.3", "sandboxed": False, "savedAt": 1757320000000}
 (agent_dir / "muse-msp-origin.json").write_text(json.dumps(origin))

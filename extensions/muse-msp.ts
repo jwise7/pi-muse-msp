@@ -12,6 +12,7 @@ import {
 	createLsToolDefinition,
 	createReadToolDefinition,
 	createWriteToolDefinition,
+	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
@@ -106,6 +107,7 @@ function reasoningEffort(level: ThinkingLevel | undefined): string | undefined {
 // ---------------------------------------------------------------------------
 
 type Pending = {
+	generation: number;
 	resolve: (value: Record<string, unknown>) => void;
 	reject: (error: Error) => void;
 };
@@ -124,7 +126,8 @@ class MspHost {
 	private pending = new Map<number, Pending>();
 	private notificationHandlers = new Map<string, Set<NotificationHandler>>();
 	private buffer = "";
-	private ready: Promise<void> | null = null;
+	private ready: { generation: number; promise: Promise<void> } | null = null;
+	private generation = 0;
 	private fingerprint: string | null = null;
 	private sandboxed: boolean | null = null;
 	private spawnError: string | null = null;
@@ -147,14 +150,19 @@ class MspHost {
 		// recorded spawnError (previously this retried the dead host forever).
 		const alive =
 			!!this.child && !this.child.killed && this.child.exitCode === null && !this.spawnError;
-		if (!alive || this.sandboxed !== sandboxed) {
+		if (this.child && (!alive || this.sandboxed !== sandboxed)) {
 			// Sandbox posture is fixed for the host lifetime: respawn on change.
-			// dispose() clears `ready`, so concurrent callers share the single
-			// respawn below instead of spawning twice (no await between).
-			this.dispose();
+			this.dispose(!alive ? "ensure: dead or failed host" : "ensure: sandbox posture changed");
 		}
 		if (!this.ready) this.ready = this.spawn(sandboxed);
-		await this.ready;
+		const ready = this.ready;
+		await ready.promise;
+		// dispose() may replace a host while an older child's close/error event
+		// is still queued. Follow the current generation rather than leaking an
+		// old generation's result into this caller.
+		if (ready !== this.ready || ready.generation !== this.generation) {
+			return this.ensure(sandboxed);
+		}
 		if (this.spawnError) throw new Error(this.spawnError);
 	}
 
@@ -162,8 +170,12 @@ class MspHost {
 		return this.fingerprint;
 	}
 
-	private spawn(sandboxed: boolean): Promise<void> {
-		return new Promise((resolve) => {
+	private spawn(sandboxed: boolean): { generation: number; promise: Promise<void> } {
+		const generation = ++this.generation;
+		this.spawnError = null;
+		this.fingerprint = null;
+		this.buffer = "";
+		const promise = new Promise<void>((resolve) => {
 			const args = ["serve"];
 			if (!sandboxed) args.push("--disable-sandbox");
 			else args.push("--trust-workspace");
@@ -174,26 +186,37 @@ class MspHost {
 			this.child = child;
 			this.sandboxed = sandboxed;
 			let stderr = "";
+			const isCurrent = () => this.child === child && this.generation === generation;
 
 			child.stderr?.on("data", (chunk) => {
 				stderr += chunk.toString();
 			});
 			child.on("error", (error) => {
+				if (!isCurrent()) {
+					debugLog(`ignored stale host error (generation=${generation}): ${error.message}`);
+					resolve();
+					return;
+				}
 				this.spawnError =
 					`Failed to spawn \`${museBinary()} serve\`: ${error.message}. Is Muse Code installed?`;
-				for (const [, pending] of this.pending) pending.reject(new Error(this.spawnError));
-				this.pending.clear();
+				this.rejectPendingGeneration(generation, new Error(this.spawnError));
 				resolve();
 			});
 			child.on("close", (code) => {
+				if (!isCurrent()) {
+					debugLog(`ignored stale host close (generation=${generation}, code=${code ?? 1})`);
+					resolve();
+					return;
+				}
 				if (!this.spawnError) {
 					this.spawnError = `muse serve exited with code ${code ?? 1}${stderr.trim() ? `: ${stderr.trim().slice(0, 500)}` : ""}`;
 				}
-				for (const [, pending] of this.pending) pending.reject(new Error(this.spawnError));
-				this.pending.clear();
+				this.rejectPendingGeneration(generation, new Error(this.spawnError));
 				resolve();
 			});
-			child.stdout?.on("data", (chunk) => this.onData(chunk.toString()));
+			child.stdout?.on("data", (chunk) => {
+				if (isCurrent()) this.onData(chunk.toString());
+			});
 			// A long-lived host must not keep `pi -p` alive after the turn
 			// ends: release every handle from the event loop. Normal process
 			// exit still kills the host via the module exit hook below.
@@ -214,6 +237,10 @@ class MspHost {
 				clientInfo: { name: "pi_muse_msp", title: "Pi Muse MSP", version: CLIENT_VERSION },
 			}).then(
 				(result) => {
+					if (!isCurrent()) {
+						resolve();
+						return;
+					}
 					const schema = (result["schema"] ?? {}) as Record<string, unknown>;
 					if (typeof schema["fingerprint"] === "string") {
 						this.fingerprint = schema["fingerprint"] as string;
@@ -222,11 +249,20 @@ class MspHost {
 					resolve();
 				},
 				(error) => {
-					this.spawnError = error instanceof Error ? error.message : String(error);
+					if (isCurrent()) this.spawnError = error instanceof Error ? error.message : String(error);
 					resolve();
 				},
 			);
 		});
+		return { generation, promise };
+	}
+
+	private rejectPendingGeneration(generation: number, error: Error): void {
+		for (const [id, pending] of this.pending) {
+			if (pending.generation !== generation) continue;
+			this.pending.delete(id);
+			pending.reject(error);
+		}
 	}
 
 	private onData(chunk: string): void {
@@ -249,10 +285,12 @@ class MspHost {
 		debugLog(
 			`<- ${String(message["method"] ?? "")} ${typeof message["id"] !== "undefined" ? `(id=${String(message["id"])})` : "(notification)"} ${JSON.stringify(message).slice(0, 200)}`,
 		);
-		if (typeof message["id"] === "number" || typeof message["id"] === "string") {
-			const pending = this.pending.get(message["id"] as number);
-			if (!pending) return;
-			this.pending.delete(message["id"] as number);
+		// Requests always carry numeric ids (see request()); anything else is a
+		// notification or a foreign message and falls through below.
+		if (typeof message["id"] === "number") {
+			const pending = this.pending.get(message["id"]);
+			if (!pending || pending.generation !== this.generation) return;
+			this.pending.delete(message["id"]);
 			if ("error" in message && message["error"] !== undefined) {
 				const error = message["error"] as Record<string, unknown>;
 				const data = error["data"] as Record<string, unknown> | undefined;
@@ -343,10 +381,12 @@ class MspHost {
 			return Promise.reject(new Error("muse serve host is not running"));
 		}
 		const id = this.nextId++;
-		debugLog(`-> ${method} (id=${id})`);
+		const generation = this.generation;
+		debugLog(`-> ${method} (id=${id}, generation=${generation})`);
 		const release = this.hold();
 		return new Promise((resolve, reject) => {
 			this.pending.set(id, {
+				generation,
 				resolve: (value) => {
 					release();
 					resolve(value);
@@ -369,29 +409,38 @@ class MspHost {
 	}
 
 	notify(method: string, params: Record<string, unknown>): void {
-		this.child?.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+		// Swallow stream errors: a write racing host death must not surface
+		// as an unhandled error from a fire-and-forget notification.
+		this.child?.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`, () => {});
 	}
 
-	dispose(): void {
+	dispose(reason = "dispose"): void {
 		const child = this.child;
-		try {
-			child?.kill();
-			if (child && child.exitCode === null) {
-				const reap = setTimeout(() => child.kill("SIGKILL"), 1_000);
-			reap.unref();
-			child.once("exit", () => clearTimeout(reap));
-			}
-		} catch {
-			// ignore
-		}
+		const generation = this.generation;
+		debugLog(`disposing host (generation=${generation}, reason=${reason})`);
+		// Invalidate this generation before signaling it. Its asynchronous
+		// close/error/stdout callbacks must not mutate a replacement host.
+		this.generation++;
 		this.child = null;
 		this.ready = null;
 		this.spawnError = null;
+		this.fingerprint = null;
+		this.sandboxed = null;
 		this.buffer = "";
 		this.holds = 0;
 		for (const [, pending] of this.pending) pending.reject(new Error("muse serve host was restarted"));
 		this.pending.clear();
 		attached.clear();
+		try {
+			child?.kill();
+			if (child && child.exitCode === null) {
+				const reap = setTimeout(() => child.kill("SIGKILL"), 1_000);
+				reap.unref();
+				child.once("exit", () => clearTimeout(reap));
+			}
+		} catch {
+			// ignore
+		}
 	}
 }
 
@@ -400,7 +449,7 @@ const host = new MspHost();
 // Reap the host on normal exit (its handles are unref'd, so without this it
 // would be orphaned when the loop drains in `pi -p` mode).
 process.once("exit", () => {
-	host.dispose();
+	host.dispose("process exit");
 });
 
 // ---------------------------------------------------------------------------
@@ -489,30 +538,50 @@ function userMessageParts(
 }
 
 function messageFingerprint(message: Context["messages"][number]): string {
-	if (message.role === "user") {
+	const record = message as unknown as Record<string, unknown>;
+	const role = typeof record["role"] === "string" ? record["role"] : "unknown";
+	const rawContent = record["content"];
+	if (role === "user") {
 		const images: MspImage[] = [];
-		const text = userMessageParts(message, images);
+		const text =
+			typeof rawContent === "string" || Array.isArray(rawContent)
+				? userMessageParts(message as Extract<Context["messages"][number], { role: "user" }>, images)
+				: String(record["summary"] ?? "");
 		const imageFp = images
 			.map((image) => `${image.mediaType}:${createHash("sha256").update(image.base64Data).digest("hex")}`)
 			.join(",");
 		return `user:${text}\n${imageFp}`;
 	}
-	if (message.role === "toolResult") {
-		const text = message.content
-			.filter((part) => part.type === "text")
-			.map((part) => part.text)
-			.join("\n");
-		return `tool:${message.toolName}:${message.isError ? "1" : "0"}:${text}`;
+	if (role === "toolResult") {
+		const text = Array.isArray(rawContent)
+			? rawContent
+					.filter((part): part is { type: "text"; text: string } =>
+						!!part && typeof part === "object" && (part as Record<string, unknown>)["type"] === "text",
+					)
+					.map((part) => String((part as Record<string, unknown>)["text"] ?? ""))
+					.join("\n")
+			: typeof rawContent === "string"
+				? rawContent
+				: "";
+		return `tool:${String(record["toolName"] ?? "")}:${record["isError"] ? "1" : "0"}:${text}`;
 	}
-	const content = message.content
-		.map((part) => {
-			if (part.type === "text") return part.text;
-			if (part.type === "toolCall") return `Tool call: ${part.name}(${JSON.stringify(part.arguments)})`;
-			return "";
-		})
-		.filter(Boolean)
-		.join("\n");
-	return `assistant:${content}`;
+	const content = Array.isArray(rawContent)
+		? rawContent
+				.map((part) => {
+					if (!part || typeof part !== "object") return "";
+					const item = part as Record<string, unknown>;
+					if (item["type"] === "text") return String(item["text"] ?? "");
+					if (item["type"] === "toolCall") {
+						return `Tool call: ${String(item["name"] ?? "")}(${JSON.stringify(item["arguments"])})`;
+					}
+					return "";
+				})
+				.filter(Boolean)
+				.join("\n")
+		: typeof rawContent === "string"
+			? rawContent
+			: String(record["summary"] ?? record["output"] ?? "");
+	return `${role}:${content}`;
 }
 
 function fingerprintMessages(messages: Context["messages"]): string {
@@ -721,6 +790,10 @@ const SESSION_INDEX_MAX = 50;
 // before concluding the live turn/completed notification is truly missing
 // (rather than merely slow) and abandoning the session.
 const SALVAGE_TERMINAL_GRACE_MS = 6_000;
+// Muse can durably accept and execute turn/start while its MSP view projector
+// loses the JSON-RPC acknowledgement. Continue into durable-log monitoring
+// instead of waiting forever before the salvage timer is installed.
+const TURN_START_ACK_TIMEOUT_MS = 5_000;
 
 type PersistedSession = LiveSession & { savedAt: number };
 
@@ -750,6 +823,17 @@ function writeOriginFile(entry: { sessionId: string; cwd: string; model: string;
 		);
 	} catch {
 		// ignore
+	}
+}
+
+function latestOriginSessionId(): string | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(originPath(), "utf-8")) as Record<string, unknown>;
+		return typeof parsed["sessionId"] === "string" && parsed["sessionId"]
+			? (parsed["sessionId"] as string)
+			: undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -1085,13 +1169,26 @@ function museSessionJsonl(sessionId: string): string | undefined {
 	const ms = uuid7UnixMs(sessionId);
 	if (ms === undefined) return undefined;
 	const date = new Date(ms);
-	const stamp = [
-		String(date.getUTCFullYear()),
-		String(date.getUTCMonth() + 1).padStart(2, "0"),
-		String(date.getUTCDate()).padStart(2, "0"),
-	].join("/");
-	const path = join(root, stamp, sessionId, "session.jsonl");
-	return existsSync(path) ? path : undefined;
+	// Muse partitions sessions by the machine's local calendar date. UTC can
+	// differ near midnight (and older/test installations may use UTC), so try
+	// both rather than silently disabling durable recovery for those sessions.
+	const stamps = [
+		[
+			String(date.getFullYear()),
+			String(date.getMonth() + 1).padStart(2, "0"),
+			String(date.getDate()).padStart(2, "0"),
+		].join("/"),
+		[
+			String(date.getUTCFullYear()),
+			String(date.getUTCMonth() + 1).padStart(2, "0"),
+			String(date.getUTCDate()).padStart(2, "0"),
+		].join("/"),
+	];
+	for (const stamp of new Set(stamps)) {
+		const path = join(root, stamp, sessionId, "session.jsonl");
+		if (existsSync(path)) return path;
+	}
+	return undefined;
 }
 
 function tailJsonlLines(path: string, maxBytes = 256_000): string[] {
@@ -1190,14 +1287,22 @@ function scanSessionLog(
 			}
 			continue;
 		}
-		if (parsed.kind !== "assistant_message_committed") continue;
+		if (parsed.kind !== "assistant_message_committed" && parsed.kind !== "reasoning_summary_committed") {
+			continue;
+		}
 		const text = committedPlaintext(parsed.event);
 		if (!text) continue;
 		const key =
 			typeof parsed.event["message_id"] === "string"
-				? (parsed.event["message_id"] as string)
-				: text;
-		if (terminalOk && terminalRun && parsed.runId === terminalRun && recovered === undefined) {
+				? `${String(parsed.kind)}:${parsed.event["message_id"] as string}`
+				: `${String(parsed.kind)}:${text}`;
+		if (
+			parsed.kind === "assistant_message_committed" &&
+			terminalOk &&
+			terminalRun &&
+			parsed.runId === terminalRun &&
+			recovered === undefined
+		) {
 			recovered = text;
 			recoveredKey = key;
 			continue;
@@ -1209,6 +1314,32 @@ function scanSessionLog(
 	progress.reverse();
 	images.reverse();
 	return { progress, recovered, failedReason, images };
+}
+
+/** Recover the newest completed plaintext answer even if a later interrupt
+ * appended an aborted terminal while releasing a stuck Pi turn. */
+function latestCompletedAnswerFromLog(sessionId: string): string | undefined {
+	const path = museSessionJsonl(sessionId);
+	if (!path) return undefined;
+	const completedRuns = new Set<string>();
+	for (const line of tailJsonlLines(path, 4_000_000).reverse()) {
+		let record: Record<string, unknown>;
+		try {
+			record = JSON.parse(line) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+		const parsed = payloadEvent(record);
+		if (!parsed?.runId) continue;
+		if (parsed.kind === "terminal" && parsed.event["terminal"] === "completed") {
+			completedRuns.add(parsed.runId);
+			continue;
+		}
+		if (parsed.kind !== "assistant_message_committed" || !completedRuns.has(parsed.runId)) continue;
+		const text = committedPlaintext(parsed.event);
+		if (text) return text;
+	}
+	return undefined;
 }
 
 /** Approvals sitting in the durable log with no decision — view notifications may never arrive. */
@@ -1962,9 +2093,37 @@ export function streamMuseMsp(
 					}
 				})();
 			};
+			const startTurn = async (): Promise<Record<string, unknown>> => {
+				const params = turnParams();
+				const provisionalTurnId = turnId;
+				try {
+					return await withTimeout(
+						host.request("turn/start", params),
+						TURN_START_ACK_TIMEOUT_MS,
+						"turn/start acknowledgement",
+					);
+				} catch (error) {
+					if (
+						error instanceof Error &&
+						error.message === "turn/start acknowledgement timed out" &&
+						provisionalTurnId
+					) {
+						debugLog(
+							`turn/start acknowledgement timed out; monitoring durable log ` +
+							`session=${sessionId} turn=${provisionalTurnId}`,
+						);
+						append(
+							"thinking",
+							"[muse-msp: turn accepted without a live acknowledgement; monitoring the durable Muse session log]\n",
+						);
+						return { turnId: provisionalTurnId, disposition: "acknowledgementTimedOut" };
+					}
+					throw error;
+				}
+			};
 			let turnResult: Record<string, unknown>;
 			try {
-				turnResult = await host.request("turn/start", turnParams());
+				turnResult = await startTurn();
 			} catch (error) {
 				if (!reused) throw error;
 				debugLog(`session reuse failed, starting fresh: ${error instanceof Error ? error.message : String(error)}`);
@@ -1974,9 +2133,9 @@ export function streamMuseMsp(
 				parts = conversationParts(context);
 				sentImages = parts.some((part) => part["type"] === "image");
 				reused = false;
-				turnResult = await host.request("turn/start", turnParams());
+				turnResult = await startTurn();
 			}
-			turnId = String(turnResult["turnId"] ?? "");
+			turnId = String(turnResult["turnId"] ?? turnId ?? "");
 			debugLog(`turn started: session=${sessionId} turn=${turnId} reused=${reused}`);
 			if (!turnId) throw new Error("Muse MSP turn/start returned no turnId");
 			// Publish the running turn so native Pi steering can exact-target it
@@ -2255,7 +2414,11 @@ export default function museMsp(pi: ExtensionAPI): void {
 	// have no bridge and retain non-interactive behavior.
 	pi.on("context", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_ID) return;
-		const messages = event.messages as Context["messages"];
+		// Context hooks receive Pi AgentMessages (including compactionSummary,
+		// branchSummary, custom, and bashExecution), while providers receive
+		// LLM Messages. Normalize here so this key exactly matches bridgeFor()
+		// and never assumes every raw AgentMessage has a content array.
+		const messages = convertToLlm(event.messages) as Context["messages"];
 		uiBridges.set(chatKey(ctx.cwd, bareModelId(ctx.model.id), messages), {
 			ui: ctx.ui,
 			hasUI: ctx.hasUI,
@@ -2269,7 +2432,7 @@ export default function museMsp(pi: ExtensionAPI): void {
 		// /reload creates a new extension module instance. Always reap this
 		// instance's provider and host so neither can retain stale state.
 		unregisterApiProviders(API_PROVIDER_SOURCE);
-		host.dispose();
+		host.dispose(`session shutdown: ${event.reason}`);
 	});
 	pi.on("input", async (event, ctx) => {
 		if (
@@ -2304,6 +2467,28 @@ export default function museMsp(pi: ExtensionAPI): void {
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
+		},
+	});
+	pi.registerCommand("muse-msp-recover-completed", {
+		description: "Recover the newest completed assistant answer from a Muse durable session log",
+		handler: async (args, ctx) => {
+			const sessionId = args.trim() || latestOriginSessionId();
+			if (!sessionId) {
+				ctx.ui.notify("muse-msp: no session id supplied and no origin session is available", "error");
+				return;
+			}
+			const recovered = latestCompletedAnswerFromLog(sessionId);
+			if (!recovered) {
+				ctx.ui.notify(`muse-msp: no completed plaintext answer exists for ${sessionId}`, "error");
+				return;
+			}
+			pi.sendMessage({
+				customType: "muse-msp-recovered",
+				content: recovered,
+				display: true,
+				details: { sessionId },
+			});
+			ctx.ui.notify(`Recovered completed Muse answer from ${sessionId}`, "info");
 		},
 	});
 	pi.registerCommand("muse-msp-sessions", {

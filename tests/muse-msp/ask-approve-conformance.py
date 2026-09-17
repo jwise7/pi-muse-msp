@@ -5,7 +5,7 @@ import pathlib
 
 here = pathlib.Path(__file__).resolve().parent
 ext = (here.parents[1] / "extensions/muse-msp.ts").read_text()
-skill = (pathlib.Path.home() / ".config/muse/skills/pi-ask-and-approve/SKILL.md").read_text()
+skill_path = pathlib.Path.home() / ".config/muse/skills/pi-ask-and-approve/SKILL.md"
 
 # auto-approval path the skill promises
 for snippet in ['approvalMode: sandboxed ? "onRequest" : "allowAll"',
@@ -27,6 +27,12 @@ for snippet in ['reason: "Pi has no interactive UI"',
                 '"userInput/clarify"',
                 '"userInput/cancel"']:
     assert snippet in ext, snippet
+
+if not skill_path.is_file():
+    print("PASS: extension approval/clarification behaviors present "
+          "(SKILL.md cross-check SKIP: not installed)")
+    raise SystemExit(0)
+skill = skill_path.read_text()
 
 # the skill must actually mention each promise (no silent drift the other way)
 for phrase in ["allowAll", "auto-approved", "Let me explain",

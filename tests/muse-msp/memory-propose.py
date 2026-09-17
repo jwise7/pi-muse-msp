@@ -8,6 +8,9 @@ import tempfile
 
 here = pathlib.Path(__file__).resolve().parent
 helper = pathlib.Path.home() / ".config/muse/skills/pi-memory-propose/propose.mjs"
+if not helper.is_file():
+    print("SKIP: pi-memory-propose propose.mjs not installed")
+    raise SystemExit(0)
 agent_home = pathlib.Path(tempfile.mkdtemp(prefix="pi-propose-home.", dir="/tmp"))
 agent_dir = agent_home / ".pi" / "agent"
 env = {**os.environ, "PI_CODING_AGENT_DIR": str(agent_dir)}
