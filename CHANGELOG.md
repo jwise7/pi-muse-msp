@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2
+
+Tested against Pi 0.85.1 (`pi-ai` / `pi-ai/compat` provider API).
+
+- Hold durable-log progress while live view events flow: the finished
+  answer no longer re-renders as dimmed thinking on reasoning-heavy turns
+- Salvage progress carries reasoning summaries only; assistant commits are
+  terminal answers and feed text-channel recovery alone
+
 ## 0.2.1
 
 Tested against Pi 0.85.1 (`pi-ai` / `pi-ai/compat` provider API).

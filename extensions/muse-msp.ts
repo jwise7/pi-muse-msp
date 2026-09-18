@@ -42,7 +42,7 @@ const PROVIDER_ID = "muse-msp";
 const MSP_API = "muse-msp" as Api;
 const API_PROVIDER_SOURCE = "local:muse-msp";
 const MSP_FINGERPRINT = process.env.PI_MUSE_MSP_FINGERPRINT?.trim() ?? "";
-const CLIENT_VERSION = "0.2.1";
+const CLIENT_VERSION = "0.2.2";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -784,6 +784,11 @@ const SESSION_INDEX_MAX = 50;
 // before concluding the live turn/completed notification is truly missing
 // (rather than merely slow) and abandoning the session.
 const SALVAGE_TERMINAL_GRACE_MS = 6_000;
+// How long the live view may go silent before the salvage poll treats it as
+// stalled and shows durable-log progress. While deltas flow, durable commits
+// only duplicate what already streamed (pre-terminal assistant commits
+// re-render the answer as thinking), so progress stays held. Three polls.
+const SALVAGE_PROGRESS_STALL_MS = 6_000;
 // Muse can durably accept and execute turn/start while its MSP view projector
 // loses the JSON-RPC acknowledgement. Continue into durable-log monitoring
 // instead of waiting forever before the salvage timer is installed.
@@ -1356,7 +1361,7 @@ function committedPlaintext(event: Record<string, unknown>): string | undefined 
  * messages can sit far apart in a long session log. */
 const RECOVERY_SCAN_MAX_BYTES = 4_000_000;
 
-/** Durable Muse log: plaintext progress, a finished reply after completed `terminal`, or a failed terminal plus tool-read images. Ignores `encrypted_content`. */
+/** Durable Muse log: reasoning-summary progress, a finished reply after completed `terminal`, or a failed terminal plus tool-read images. Ignores `encrypted_content`. */
 function scanSessionLog(
 	sessionId: string,
 	afterMs: number,
@@ -1416,15 +1421,15 @@ function scanSessionLog(
 			typeof parsed.event["message_id"] === "string"
 				? `${String(parsed.kind)}:${parsed.event["message_id"] as string}`
 				: `${String(parsed.kind)}:${text}`;
-		if (
-			parsed.kind === "assistant_message_committed" &&
-			terminalOk &&
-			terminalRun &&
-			parsed.runId === terminalRun &&
-			recovered === undefined
-		) {
-			recovered = text;
-			recoveredKey = key;
+		if (parsed.kind === "assistant_message_committed") {
+			// Assistant commits are terminal answers, never interim progress:
+			// every run commits exactly one (the final reply), so routing one
+			// to thinking can only duplicate it. Only the terminal run's
+			// answer is kept, as the text-channel recovery.
+			if (terminalOk && terminalRun && parsed.runId === terminalRun && recovered === undefined) {
+				recovered = text;
+				recoveredKey = key;
+			}
 			continue;
 		}
 		if (seen.has(key) || key === recoveredKey) continue;
@@ -2050,6 +2055,18 @@ export function streamMuseMsp(
 			}
 			sentImages = parts.some((part) => part["type"] === "image");
 			let mySession = sessionId;
+			// Durable-log progress is a dead-projector fallback: it must only
+			// display while the live view is silent (or reported a gap), never
+			// while deltas are flowing. lastLiveEventMs starts at zero (stalled)
+			// and is stamped by the turn ack plus every live notification below.
+			let lastLiveEventMs = 0;
+			let viewGapSeen = false;
+			const markLive = () => {
+				lastLiveEventMs = Date.now();
+			};
+			const markLiveIfMine = (params: Record<string, unknown>) => {
+				if (params["sessionId"] === mySession && !settled) markLive();
+			};
 			salvageAfterMs = Date.now();
 			// Keep the loop alive while the turn runs (no request is in
 			// flight between deltas); released in finish().
@@ -2059,6 +2076,7 @@ export function streamMuseMsp(
 				host.onNotification("item/delta", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
 					if (typeof params["delta"] !== "string") return;
+					markLive();
 					const delta = params["delta"];
 					const field = String(params["field"] ?? "text");
 					const itemId = String(params["itemId"] ?? "");
@@ -2075,6 +2093,7 @@ export function streamMuseMsp(
 				}),
 				host.onNotification("item/started", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
+					markLive();
 					const item = params["item"] as Record<string, unknown> | undefined;
 					if (!item || item["turnId"] !== turnId) return;
 					const kind = String(item["kind"] ?? "");
@@ -2084,6 +2103,7 @@ export function streamMuseMsp(
 				}),
 				host.onNotification("item/updated", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
+					markLive();
 					const item = params["item"] as Record<string, unknown> | undefined;
 					if (!item || item["turnId"] !== turnId) return;
 					rememberItemTarget(mySession, item);
@@ -2100,6 +2120,7 @@ export function streamMuseMsp(
 				}),
 				host.onNotification("item/completed", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
+					markLive();
 					const item = params["item"] as Record<string, unknown> | undefined;
 					if (!item || item["turnId"] !== turnId) return;
 					const kind = item["kind"];
@@ -2158,12 +2179,22 @@ export function streamMuseMsp(
 				}),
 				host.onNotification("session/tokenUsage", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
+					markLive();
 					applyTokenUsage(output, params["usage"]);
 					if (model) calculateCost(model, output.usage);
 				}),
-				host.onNotification("approval/requested", handleApproval),
-				host.onNotification("approval/updated", handleApproval),
-				host.onNotification("userInput/requested", handleUserInput),
+				host.onNotification("approval/requested", (params) => {
+					markLiveIfMine(params);
+					handleApproval(params);
+				}),
+				host.onNotification("approval/updated", (params) => {
+					markLiveIfMine(params);
+					handleApproval(params);
+				}),
+				host.onNotification("userInput/requested", (params) => {
+					markLiveIfMine(params);
+					handleUserInput(params);
+				}),
 				host.onNotification("turn/completed", (params) => {
 					if (params["sessionId"] !== mySession) return;
 					if (settled) {
@@ -2214,10 +2245,14 @@ export function streamMuseMsp(
 				}),
 				host.onNotification("view/gap", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
-					debugLog("view/gap; will salvage from session log if the turn already completed");
+					// The projector admits it dropped events: durable progress
+					// fills the gap even while other live events still flow.
+					viewGapSeen = true;
+					debugLog("view/gap; durable-log progress unblocked for this turn");
 				}),
 				host.onNotification("session/todoListChanged", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
+					markLive();
 					const items = Array.isArray(params["items"])
 						? (params["items"] as Array<Record<string, unknown>>)
 						: [];
@@ -2237,6 +2272,7 @@ export function streamMuseMsp(
 				}),
 				host.onNotification("session/contextUsage", (params) => {
 					if (params["sessionId"] !== mySession || settled) return;
+					markLive();
 					const pressure = strField(params, "pressure");
 					if (pressure !== "warning" && pressure !== "blocked") return;
 					if (pressure === lastPressure) return;
@@ -2331,6 +2367,8 @@ export function streamMuseMsp(
 						sentImages = parts.some((part) => part["type"] === "image");
 						salvageAfterMs = Date.now();
 						viewUnhealthy = false;
+						viewGapSeen = false;
+						markLive();
 						todoCompleteNoted = false;
 						lastPressure = "";
 						mediaRetry = "done";
@@ -2386,6 +2424,9 @@ export function streamMuseMsp(
 				turnResult = await startTurn();
 			}
 			turnId = String(turnResult["turnId"] ?? turnId ?? "");
+			// A live acknowledgement proves the view is up; a timed-out ack
+			// leaves the stamp at zero so durable progress flows immediately.
+			if (turnResult["disposition"] !== "acknowledgementTimedOut") markLive();
 			debugLog(`turn started: session=${sessionId} turn=${turnId} reused=${reused}`);
 			if (!turnId) throw new Error("Muse MSP turn/start returned no turnId");
 			// Publish the running turn so native Pi steering can exact-target it
@@ -2433,13 +2474,26 @@ export function streamMuseMsp(
 			};
 			const salvage = () => {
 				if (settled || !sessionId) return;
+				// While live view events flow, durable progress only duplicates
+				// what already streamed — hold it. A silent view (or a reported
+				// gap / confirmed-unhealthy projector) means the durable log is
+				// the only signal left: show durable progress. Approvals and
+				// terminal recovery below stay ungated.
+				const liveStalled =
+					viewGapSeen || viewUnhealthy || Date.now() - lastLiveEventMs >= SALVAGE_PROGRESS_STALL_MS;
 				const { progress, recovered, failedReason, images } = scanSessionLog(
 					sessionId,
 					salvageAfterMs,
-					seenThoughts,
+					// Held-back thoughts must not burn their seen keys: if the
+					// view dies later, they still need to display.
+					liveStalled ? seenThoughts : new Set<string>(),
 				);
-				for (const thought of progress) {
-					if (!alreadyShown(thought)) append("thinking", thought.endsWith("\n") ? thought : `${thought}\n`);
+				if (liveStalled) {
+					for (const thought of progress) {
+						if (!alreadyShown(thought)) append("thinking", thought.endsWith("\n") ? thought : `${thought}\n`);
+					}
+				} else if (progress.length > 0) {
+					debugLog(`salvage progress held (${progress.length} item(s); live view active)`);
 				}
 				if (!sandboxed) {
 					const sid = sessionId;

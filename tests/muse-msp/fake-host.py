@@ -68,6 +68,47 @@ with open(log_path, "a") as _argv_log:
     _argv_log.write("argv:" + " ".join(sys.argv[1:]) + "\n")
 
 
+def write_durable_records(session_id, turn_id, terminal):
+    """Mid-turn durable state: summary + answer commits, terminal optional."""
+    millis = int(session_id.replace("-", "")[:12], 16)
+    date = datetime.datetime.fromtimestamp(millis / 1000, datetime.timezone.utc)
+    path = os.path.join(
+        os.path.expanduser("~/.local/share/muse/sessions"),
+        date.strftime("%Y/%m/%d"), session_id, "session.jsonl",
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    now = time.time_ns() // 1000
+    records = [
+        {
+            "recorded_at": now,
+            "payload": {
+                "run_id": turn_id,
+                "event": {"kind": "reasoning_summary_committed", "message_id": "summary-1", "text": "Durable recovery summary"},
+            },
+        },
+        {
+            "recorded_at": now + 1,
+            "payload": {
+                "run_id": turn_id,
+                "event": {"kind": "assistant_message_committed", "message_id": "answer-1", "text": "SLOW-ANSWER"},
+            },
+        },
+    ]
+    if terminal:
+        records.append(
+            {
+                "recorded_at": now + 2,
+                "payload": {
+                    "run_id": turn_id,
+                    "event": {"kind": "terminal", "terminal": "completed", "reason": None},
+                },
+            }
+        )
+    with open(path, "a") as output:
+        for record in records:
+            output.write(json.dumps(record) + "\n")
+
+
 def write_durable_completed(session_id, turn_id, text):
     millis = int(session_id.replace("-", "")[:12], 16)
     date = datetime.datetime.fromtimestamp(millis / 1000, datetime.timezone.utc)
@@ -201,6 +242,16 @@ for line in sys.stdin:
             notify("item/completed", {"sessionId": session_id, "item": {"itemId": "rs1", "turnId": turn_id, "kind": "reasoning", "summary": ["First I consider X", "Then Y"]}})
             notify("item/delta", {"sessionId": session_id, "itemId": "answer", "field": "text", "delta": "VISIBLE-ANSWER"})
             notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "VISIBLE-ANSWER"}})
+            notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed"})
+        elif os.environ.get("FAKE_SLOW_DURABLE") == "1":
+            # Durable commits land mid-turn (no terminal yet) while live deltas
+            # keep flowing: salvage must hold durable progress, not duplicate it.
+            write_durable_records(session_id, turn_id, terminal=False)
+            notify("item/delta", {"sessionId": session_id, "itemId": "rs1", "field": "summary.0", "delta": "Durable recovery summary"})
+            notify("item/delta", {"sessionId": session_id, "itemId": "answer", "field": "text", "delta": "SLOW-"})
+            time.sleep(3.5)
+            notify("item/delta", {"sessionId": session_id, "itemId": "answer", "field": "text", "delta": "ANSWER"})
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "SLOW-ANSWER"}})
             notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed"})
         elif os.environ.get("FAKE_HANG") == "1":
             pass

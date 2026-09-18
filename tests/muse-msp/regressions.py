@@ -174,6 +174,30 @@ check_compaction_context()
 # acknowledgement and every live event. The extension must enter log salvage,
 # show the bounded reasoning summary, and recover the terminal answer.
 check({'FAKE_DURABLE_NO_ACK': '1'}, 'DURABLE-ANSWER', 1)
+
+
+def check_slow_durable_hold():
+    # Slow turn with durable commits visible mid-turn while live deltas flow:
+    # salvage must hold durable progress (not re-render the answer as
+    # thinking). The hold is observable via the debug marker; -p hides
+    # thinking blocks, so a duplicate would otherwise be invisible here.
+    # Exactly 1 held item proves the assistant commit is excluded from
+    # progress (reasoning summary only); 2 would mean the answer duplexed.
+    with tempfile.TemporaryDirectory(prefix='msp-hold-') as tmp:
+        log = Path(tmp) / 'calls'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('FAKE_')}
+        env.update(HOME=tmp, PI_MUSE_BINARY=str(here / 'fake-host.py'), FAKE_MSP_LOG=str(log),
+                   FAKE_SLOW_DURABLE='1', PI_MUSE_MSP_DEBUG='1')
+        result = subprocess.run(['pi', '--no-session', '--no-extensions', '-e', str(extension),
+            '--provider', 'muse-msp', '--model', 'muse-spark-1.3', '--no-tools',
+            '-p', 'Test request'], env=env, text=True, capture_output=True, timeout=25)
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert 'SLOW-ANSWER' in output, output
+        assert 'salvage progress held (1 item(s)' in output, output
+
+
+check_slow_durable_hold()
 check_user_input()
 check_hang_start()
 check_modellist_hang()
@@ -192,4 +216,4 @@ subprocess.run(['python3', str(here / 'persistence-resume.py')], check=True, tim
 for suite in ('proposals-inbox.py', 'session-context.py', 'memory-propose.py',
               'ask-approve-conformance.py'):
     subprocess.run(['python3', str(here / suite)], check=True, timeout=90)
-print('PASS: version sync, event recovery, bounded repeated failure, duplicate/resolved approvals, image log recovery, compaction context, host generation isolation, pre-ack durable recovery, headless userInput cancel, hung-RPC bounds, vision retry, salvage-fresh, mid-turn steer, turn lifecycle, model switch, subscribers, subagent drill-down, workspace trust, persisted resume, machine-local suites')
+print('PASS: version sync, event recovery, bounded repeated failure, duplicate/resolved approvals, image log recovery, compaction context, host generation isolation, pre-ack durable recovery, live-view progress hold, headless userInput cancel, hung-RPC bounds, vision retry, salvage-fresh, mid-turn steer, turn lifecycle, model switch, subscribers, subagent drill-down, workspace trust, persisted resume, machine-local suites')
