@@ -65,6 +65,36 @@ export default function injectCompaction(pi: any): void {
         assert 'Extension "' not in output, output
 
 
+def check_system_transcript():
+    # Pi 0.86+ folds the system prompt into a leading {role:"system"}
+    # transcript message with string content, and TranscriptContext carries
+    # no systemPrompt field. The provider must neither crash on it
+    # ("message.content.map is not a function") nor silently drop the
+    # prompt: the turn/start input keeps its ## System instructions head.
+    # (On Pi <=0.85 the transcript has no system messages — injected ones
+    # are stripped before the provider — so there the head block still
+    # comes from context.systemPrompt and this guards that path instead.)
+    with tempfile.TemporaryDirectory(prefix='msp-systranscript-') as tmp:
+        tmp = Path(tmp)
+        log = tmp / 'calls'
+        inputs = tmp / 'inputs'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('FAKE_')}
+        env.update(HOME=str(tmp), PI_MUSE_BINARY=str(here / 'fake-host.py'),
+                   FAKE_MSP_LOG=str(log), FAKE_MSP_INPUT_LOG=str(inputs), FAKE_REASONING='1')
+        result = subprocess.run(['pi', '--no-session', '--no-extensions', '-e', str(extension),
+            '--provider', 'muse-msp', '--model', 'muse-spark-1.3', '--no-tools',
+            '-p', 'Test request'], env=env, text=True, capture_output=True, timeout=20)
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert 'VISIBLE-ANSWER' in output, output
+        assert 'is not a function' not in output, output
+        records = [json.loads(line) for line in inputs.read_text().splitlines()]
+        texts = [record['text'] for record in records if record.get('method') == 'turn/start']
+        assert texts, 'no turn/start input captured'
+        assert '## System instructions' in texts[0], texts[0][:500]
+        assert 'expert coding assistant' in texts[0], texts[0][:500]
+
+
 def check_user_input():
     # Headless clarification path: no Pi UI, so the extension must cancel the
     # prompt server-side and fail the turn with an actionable notice.
@@ -170,6 +200,7 @@ check(
     'VISIBLE-ANSWER', 1, extra_args=('--muse-msp-sandboxed',),
 )
 check_compaction_context()
+check_system_transcript()
 # Muse durably executes the command but the view projector drops the turn/start
 # acknowledgement and every live event. The extension must enter log salvage,
 # show the bounded reasoning summary, and recover the terminal answer.
@@ -216,4 +247,4 @@ subprocess.run(['python3', str(here / 'persistence-resume.py')], check=True, tim
 for suite in ('proposals-inbox.py', 'session-context.py', 'memory-propose.py',
               'ask-approve-conformance.py'):
     subprocess.run(['python3', str(here / suite)], check=True, timeout=90)
-print('PASS: version sync, event recovery, bounded repeated failure, duplicate/resolved approvals, image log recovery, compaction context, host generation isolation, pre-ack durable recovery, live-view progress hold, headless userInput cancel, hung-RPC bounds, vision retry, salvage-fresh, mid-turn steer, turn lifecycle, model switch, subscribers, subagent drill-down, workspace trust, persisted resume, machine-local suites')
+print('PASS: version sync, event recovery, bounded repeated failure, duplicate/resolved approvals, image log recovery, compaction context, system transcript, host generation isolation, pre-ack durable recovery, live-view progress hold, headless userInput cancel, hung-RPC bounds, vision retry, salvage-fresh, mid-turn steer, turn lifecycle, model switch, subscribers, subagent drill-down, workspace trust, persisted resume, machine-local suites')

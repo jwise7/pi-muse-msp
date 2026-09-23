@@ -295,6 +295,10 @@ for line in sys.stdin:
             notify("item/completed", {"sessionId": session_id, "item": {"itemId": "tp-1", "turnId": turn_id, "kind": "teleport", "fallbackText": "beamed up"}})
             notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "ODD-ANSWER"}})
             notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed"})
+        elif os.environ.get("FAKE_REMINDER_ITEM") == "1":
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "rem-1", "turnId": turn_id, "kind": "reminderChild", "fallbackText": "Reminder child session"}})
+            notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "REMINDER-ANSWER"}})
+            notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed"})
         elif os.environ.get("FAKE_ITEMS") == "1":
             notify("item/completed", {"sessionId": session_id, "item": {"itemId": "sg-1", "turnId": turn_id, "kind": "subagent", "agentPath": "researcher", "objective": "find docs", "subagentId": "sub-9", "childSessionId": "cs-1", "status": "completed"}})
             notify("item/completed", {"sessionId": session_id, "item": {"itemId": "tc-1", "turnId": turn_id, "kind": "toolCall", "tool": "bash", "args": "{\"command\": \"ls\"}", "status": "completed", "outputRef": {"id": "out-7", "kind": "tool_output"}}})

@@ -82,3 +82,15 @@ try:
 finally:
     harness.stop(proc)
 print("PASS: unknown item kinds render generically")
+
+# reminderChild items stay hidden: no activity row, answer still streams.
+proc, events = run_case("pi-msp-reminder.", {"FAKE_REMINDER_ITEM": "1"})
+try:
+    text, _ = stream_text(events)
+    assert "REMINDER-ANSWER" in text, text
+    entries = harness.get_entries(proc)
+    rows = [e for e in entries if e.get("customType") == "muse-msp-activity"]
+    assert not any("eminder" in (r.get("data") or {}).get("label", "") for r in rows), entries
+finally:
+    harness.stop(proc)
+print("PASS: reminderChild items stay hidden")

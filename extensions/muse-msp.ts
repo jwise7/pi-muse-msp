@@ -42,7 +42,7 @@ const PROVIDER_ID = "muse-msp";
 const MSP_API = "muse-msp" as Api;
 const API_PROVIDER_SOURCE = "local:muse-msp";
 const MSP_FINGERPRINT = process.env.PI_MUSE_MSP_FINGERPRINT?.trim() ?? "";
-const CLIENT_VERSION = "0.2.2";
+const CLIENT_VERSION = "0.2.3";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -575,6 +575,17 @@ function messageFingerprint(message: Context["messages"][number]): string {
 		: typeof rawContent === "string"
 			? rawContent
 			: String(record["summary"] ?? record["output"] ?? "");
+	// Structured system messages (Pi ≥0.86) carry the prompt in sections with
+	// empty content; fold them in so distinct prompt states never collide.
+	// Messages without sections fingerprint exactly as before.
+	const sections = record["sections"];
+	if (sections && typeof sections === "object") {
+		const entries = Object.keys(sections as Record<string, unknown>)
+			.sort()
+			.map((key) => `${key}=${JSON.stringify((sections as Record<string, unknown>)[key])}`)
+			.join("\n");
+		if (entries) return `${role}:${content}\n${entries}`;
+	}
 	return `${role}:${content}`;
 }
 
@@ -685,6 +696,61 @@ function systemPromptBlock(systemPrompt: string | undefined): string | null {
 	return systemPrompt;
 }
 
+/** Role read through an untyped lens: Pi 0.86 added `{role:"system"}`
+ * transcript messages, which the Context type on older Pi does not know. */
+function transcriptRole(message: Context["messages"][number]): string {
+	const role = (message as unknown as { role?: unknown }).role;
+	return typeof role === "string" ? role : "";
+}
+
+/** Text of a `{role:"system"}` transcript message. Pi ≥0.86 folds
+ * Context.systemPrompt/tools into a leading system message with string
+ * content; later ones carry prompt/tool updates via content + sections.
+ * Unknown shapes yield "" rather than throwing. */
+function transcriptSystemText(message: Context["messages"][number]): string {
+	const record = message as unknown as Record<string, unknown>;
+	const texts: string[] = [];
+	const raw = record["content"];
+	if (typeof raw === "string") texts.push(raw);
+	else if (Array.isArray(raw)) {
+		for (const part of raw) {
+			if (!part || typeof part !== "object") continue;
+			const item = part as Record<string, unknown>;
+			if (item["type"] === "text") texts.push(String(item["text"] ?? ""));
+		}
+	}
+	const sections = record["sections"];
+	if (sections && typeof sections === "object") {
+		for (const value of Object.values(sections as Record<string, unknown>)) {
+			if (typeof value === "string" && value.trim()) texts.push(value);
+		}
+	}
+	return texts.filter(Boolean).join("\n\n");
+}
+
+/** Assistant history as text. Content is normally an array of blocks, but
+ * future transcript roles share this branch, so string content (and unknown
+ * shapes) degrade gracefully instead of throwing
+ * "...content.map is not a function". */
+function assistantHistoryText(message: Context["messages"][number]): string {
+	const record = message as unknown as Record<string, unknown>;
+	const raw = record["content"];
+	if (typeof raw === "string") return raw;
+	if (!Array.isArray(raw)) return String(record["summary"] ?? "");
+	return raw
+		.map((part) => {
+			if (!part || typeof part !== "object") return "";
+			const item = part as Record<string, unknown>;
+			if (item["type"] === "text") return String(item["text"] ?? "");
+			if (item["type"] === "toolCall") {
+				return `Tool call: ${String(item["name"] ?? "")}(${JSON.stringify(item["arguments"])})`;
+			}
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n");
+}
+
 function toolResultBlock(
 	message: Extract<Context["messages"][number], { role: "toolResult" }>,
 	images: MspImage[],
@@ -705,25 +771,42 @@ function conversationParts(context: Context): Array<Record<string, unknown>> {
 	}
 	const texts: string[] = [];
 	const images: MspImage[] = [];
-	const system = systemPromptBlock(context.systemPrompt);
-	if (system) texts.push(`## System instructions\n${system}`);
-	const onlyUser = context.messages.length === 1 && context.messages[0]?.role === "user";
+	// Pi ≤0.85 carries the prompt in context.systemPrompt; Pi ≥0.86 folds it
+	// into leading `{role:"system"}` transcript messages (TranscriptContext has
+	// no systemPrompt field). Collect both, deduped, so the prompt is never
+	// silently dropped on either side of the upgrade.
+	const systemTexts: string[] = [];
+	if (context.systemPrompt?.trim()) systemTexts.push(context.systemPrompt);
 	for (const message of context.messages) {
+		if (transcriptRole(message) !== "system") continue;
+		const text = transcriptSystemText(message);
+		if (text.trim() && !systemTexts.includes(text)) systemTexts.push(text);
+	}
+	const system = systemPromptBlock(systemTexts.length ? systemTexts.join("\n\n") : undefined);
+	if (system) texts.push(`## System instructions\n${system}`);
+	const substantive = context.messages.filter((message) => transcriptRole(message) !== "system");
+	const onlyUser = substantive.length === 1 && substantive[0]?.role === "user";
+	let seenSubstantive = false;
+	for (const message of context.messages) {
+		if (transcriptRole(message) === "system") {
+			// Leading prompt text is folded into the head block above;
+			// mid-conversation system messages (prompt/tool updates) ride
+			// along in place so they are never silently dropped.
+			if (seenSubstantive) {
+				const text = transcriptSystemText(message);
+				if (text.trim()) texts.push(`## System update\n${text}`);
+			}
+			continue;
+		}
+		seenSubstantive = true;
 		if (message.role === "user") {
 			const text = userMessageParts(message, images);
 			texts.push(onlyUser ? text : `## User\n${text}`);
 		} else if (message.role === "toolResult") {
 			texts.push(toolResultBlock(message, images));
 		} else {
-			const content = message.content
-				.map((part) => {
-					if (part.type === "text") return part.text;
-					if (part.type === "toolCall") return `Tool call: ${part.name}(${JSON.stringify(part.arguments)})`;
-					return "";
-				})
-				.filter(Boolean)
-				.join("\n");
-			texts.push(`## Assistant\n${content}`);
+			const label = message.role === "assistant" ? "## Assistant" : `## ${transcriptRole(message)}`;
+			texts.push(`${label}\n${assistantHistoryText(message)}`);
 		}
 	}
 	const parts = toTurnParts(texts, images);
@@ -737,6 +820,11 @@ function deltaParts(messages: Context["messages"]): Array<Record<string, unknown
 		if (message.role === "user") texts.push(userMessageParts(message, images));
 		else if (message.role === "toolResult") {
 			texts.push(toolResultBlock(message, images));
+		} else if (transcriptRole(message) === "system") {
+			// Mid-conversation prompt/tool updates on a reused session ride
+			// along so they are never silently dropped.
+			const text = transcriptSystemText(message);
+			if (text.trim()) texts.push(`## System update\n${text}`);
 		}
 	}
 	const parts = toTurnParts(texts, images);
@@ -945,7 +1033,11 @@ function sessionCwd(): string {
 }
 
 function chatKey(cwd: string, model: string, messages: Context["messages"]): string {
-	const first = messages[0];
+	// Skip transcript system messages: Pi ≥0.86 presents them differently on
+	// each side of this key (structured sections in context events, rendered
+	// text in the provider transcript), so key on the first substantive
+	// message to keep bridge registration and lookup in agreement.
+	const first = messages.find((message) => transcriptRole(message) !== "system");
 	return `${cwd}\0${model}\0${first ? messageFingerprint(first) : ""}`;
 }
 
@@ -2165,9 +2257,10 @@ export function streamMuseMsp(
 							itemId: strField(item, "itemId"),
 							failed: item["status"] !== undefined && item["status"] !== "completed",
 						});
-					} else if (kind !== "userMessage") {
+					} else if (kind !== "userMessage" && kind !== "reminderChild") {
 						// The schema requires unknown kinds to render generically;
-						// only our own user echo (which we already show) is skipped.
+						// only our own user echo (already shown) and reminder
+						// children (session noise with no drill-in value) are skipped.
 						bridge?.ui.setWorkingMessage();
 						bridge?.recordActivity({
 							label: `${String(kind) || "item"}: ${oneLine(strField(item, "fallbackText")) || strField(item, "itemId") || "update"}`,

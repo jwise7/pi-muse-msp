@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.3
+
+Tested against Pi 0.85.1 and 0.87.1 (`pi-ai` / `pi-ai/compat` provider API).
+
+- Support Pi 0.86+ transcript system messages: the provider-facing context
+  now leads with `{role:"system", content:<prompt string>}` and carries no
+  `systemPrompt` field. The old history renderer fell into its assistant
+  branch and crashed every turn with
+  `message.content.map is not a function`; system text is now folded into
+  the head `## System instructions` block (deduped with `systemPrompt` on
+  older Pi) and mid-conversation system updates ride along in place, on
+  both fresh and reused sessions
+- Key UI bridging on the first substantive message instead of the raw
+  transcript head: Pi ≥0.86 shows system messages as structured sections
+  in context events but rendered text in the provider transcript, which
+  silently unlinked activity rows; fingerprints now also fold sections in
+  so distinct prompt states never collide
+- Harden assistant-history rendering against string content and unknown
+  shapes so future transcript roles degrade gracefully instead of throwing
+- Hide `reminderChild` session items again: the 0.2.0 generic renderer
+  surfaced them as activity rows, but they carry no drill-in value
+
 ## 0.2.2
 
 Tested against Pi 0.85.1 (`pi-ai` / `pi-ai/compat` provider API).
