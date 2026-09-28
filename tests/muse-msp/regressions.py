@@ -242,9 +242,10 @@ subprocess.run(['python3', str(here / 'subscribers.py')], check=True, timeout=90
 subprocess.run(['python3', str(here / 'subagents.py')], check=True, timeout=90)
 subprocess.run(['python3', str(here / 'commands.py')], check=True, timeout=120)
 subprocess.run(['python3', str(here / 'persistence-resume.py')], check=True, timeout=180)
+subprocess.run(['python3', str(here / 'background-delivery.py')], check=True, timeout=120)
 # Machine-local suites: each skips cleanly (exit 0) when its non-repo
 # dependency — an installed skill helper or companion extension — is absent.
 for suite in ('proposals-inbox.py', 'session-context.py', 'memory-propose.py',
               'ask-approve-conformance.py'):
     subprocess.run(['python3', str(here / suite)], check=True, timeout=90)
-print('PASS: version sync, event recovery, bounded repeated failure, duplicate/resolved approvals, image log recovery, compaction context, system transcript, host generation isolation, pre-ack durable recovery, live-view progress hold, headless userInput cancel, hung-RPC bounds, vision retry, salvage-fresh, mid-turn steer, turn lifecycle, model switch, subscribers, subagent drill-down, workspace trust, persisted resume, machine-local suites')
+print('PASS: version sync, event recovery, bounded repeated failure, duplicate/resolved approvals, image log recovery, compaction context, system transcript, host generation isolation, pre-ack durable recovery, live-view progress hold, headless userInput cancel, hung-RPC bounds, vision retry, salvage-fresh, mid-turn steer, turn lifecycle, model switch, subscribers, subagent drill-down, workspace trust, persisted resume, background delivery, machine-local suites')

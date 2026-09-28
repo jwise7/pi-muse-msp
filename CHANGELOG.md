@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.4
+
+Tested against Pi 0.87.1 (`pi-ai` / `pi-ai/compat` provider API).
+
+- Deliver background completions to the Pi thread: runs that finish while
+  no Pi turn is in flight (monitor/cron wakes) previously left no trace in
+  the chat. An idle watcher now polls each kept-live session's durable log
+  for newly completed runs and posts each answer as a
+  `muse-msp-background` custom message plus a UI notification. A completed
+  run-id cursor snapshotted at every turn end keeps a turn's own answer
+  from re-posting and never backfills old history; `PI_MUSE_MSP_BACKGROUND=0`
+  disables delivery and `PI_MUSE_MSP_BACKGROUND_MS` overrides the 15s idle
+  poll interval. Delivery is event-driven: persistent `turn/completed` and
+  `session/statusChanged`-idle handlers (the host emits both for background
+  wakes under fresh turnIds, wiretap-verified) nudge the watch the moment a
+  wake lands; the interval poll stays as the backstop. Attribution is time-plus-text: a background run completing
+  during a Pi turn is deferred and posted at the next idle tick instead of
+  suppressed; only a run with text identical to the turn's answer is claimed
+  as the turn's own. Delivery itself is pure local log I/O and costs no
+  tokens; posted completions join the session context like any message.
+
 ## 0.2.3
 
 Tested against Pi 0.85.1 and 0.87.1 (`pi-ai` / `pi-ai/compat` provider API).

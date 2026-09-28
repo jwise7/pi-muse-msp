@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
@@ -42,7 +42,7 @@ const PROVIDER_ID = "muse-msp";
 const MSP_API = "muse-msp" as Api;
 const API_PROVIDER_SOURCE = "local:muse-msp";
 const MSP_FINGERPRINT = process.env.PI_MUSE_MSP_FINGERPRINT?.trim() ?? "";
-const CLIENT_VERSION = "0.2.3";
+const CLIENT_VERSION = "0.2.4";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -854,6 +854,7 @@ function forgetMspSessions(): void {
 	attached.clear();
 	activeTurns.clear();
 	turnChains.clear();
+	stopAllBackgroundWatches();
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,6 +1243,274 @@ function rememberItemTarget(sessionId: string, item: Record<string, unknown>): v
 		itemTargets.delete(oldest.value);
 	}
 }
+
+//---------------------------------------------------------------------------
+// Background-completion delivery (idle watcher)
+//---------------------------------------------------------------------------
+// A monitor/cron wake can complete a Muse run while no Pi turn is in
+// flight. The MSP host emits nothing the per-turn subscriptions consume in
+// that state, so without this watcher the finished answer would never reach
+// the Pi thread. While a chat is idle, poll its live session's durable log
+// for newly completed runs and post each answer as a custom message (durable
+// in-thread record) plus a UI notification (transient attention ping).
+//
+// Cursor: completed run_ids snapshotted at every turn end, so a turn's own
+// answer is never re-posted and enabling the watcher never backfills old
+// history. Attribution is time-plus-text: runs finished before the previous
+// turn ended are claimed, as are runs matching this turn's answer; anything
+// newer with different text — including a background run that completed
+// DURING this turn — stays unclaimed and posts at the next idle tick.
+// Residual ambiguity: a background run with text identical to the turn's
+// answer is indistinguishable from the turn's own run and is claimed.
+//---------------------------------------------------------------------------
+const BACKGROUND_POLL_MS = ((): number => {
+	const raw = Number(process.env.PI_MUSE_MSP_BACKGROUND_MS ?? "");
+	if (Number.isFinite(raw) && raw >= 250) return Math.floor(raw);
+	return 15_000;
+})();
+const BACKGROUND_DELIVERY_ENABLED = process.env.PI_MUSE_MSP_BACKGROUND !== "0";
+const BACKGROUND_SCAN_MAX_RUNS = 10;
+const BACKGROUND_DELIVERED_MAX = 50;
+const BACKGROUND_POST_MAX_PER_TICK = 5;
+
+type CompletedRun = { runId: string; text: string; terminalMs: number };
+
+/** Completed runs (oldest first) with their committed plaintext answers. */
+function completedRunsFromLog(sessionId: string): CompletedRun[] {
+	const path = museSessionJsonl(sessionId);
+	if (!path) return [];
+	const completed: string[] = [];
+	const completedSet = new Set<string>();
+	const texts = new Map<string, string>();
+	const terminalMs = new Map<string, number>();
+	for (const line of tailJsonlLines(path, RECOVERY_SCAN_MAX_BYTES).reverse()) {
+		let record: Record<string, unknown>;
+		try {
+			record = JSON.parse(line) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+		const parsed = payloadEvent(record);
+		if (!parsed?.runId) continue;
+		if (parsed.kind === "terminal" && parsed.event["terminal"] === "completed") {
+			if (!completedSet.has(parsed.runId)) {
+				completedSet.add(parsed.runId);
+				completed.push(parsed.runId);
+				terminalMs.set(parsed.runId, recordedAtMs(record["recorded_at"]));
+			}
+			continue;
+		}
+		if (
+			parsed.kind !== "assistant_message_committed" ||
+			!completedSet.has(parsed.runId) ||
+			texts.has(parsed.runId)
+		) {
+			continue;
+		}
+		const text = committedPlaintext(parsed.event);
+		if (text) texts.set(parsed.runId, text);
+		if (completed.length >= BACKGROUND_SCAN_MAX_RUNS && texts.size >= completed.length) break;
+	}
+	const runs: CompletedRun[] = [];
+	for (const runId of completed.reverse()) {
+		const text = texts.get(runId);
+		if (text !== undefined) runs.push({ runId, text, terminalMs: terminalMs.get(runId) ?? 0 });
+	}
+	return runs;
+}
+
+type BackgroundWatch = {
+	sessionId: string;
+	// Claimed runIds with their terminal times. Bounded: eviction advances
+	// floorMs so an evicted run can never re-post.
+	delivered: Map<string, number>;
+	floorMs: number;
+	prevTurnEndMs: number;
+	lastSize: number;
+	lastMtimeMs: number;
+	timer: ReturnType<typeof setInterval> | null;
+};
+const backgroundWatches = new Map<string, BackgroundWatch>();
+let activePi: ExtensionAPI | null = null;
+
+/** Whitespace-insensitive answer comparison for turn/run attribution. */
+function normalizeAnswerText(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+function claimRun(watch: BackgroundWatch, runId: string, terminalMs: number): void {
+	watch.delivered.set(runId, terminalMs);
+	while (watch.delivered.size > BACKGROUND_DELIVERED_MAX) {
+		const oldest = watch.delivered.keys().next();
+		if (oldest.done) break;
+		const evictedMs = watch.delivered.get(oldest.value) ?? 0;
+		watch.delivered.delete(oldest.value);
+		if (evictedMs > watch.floorMs) watch.floorMs = evictedMs;
+	}
+}
+
+function deliverBackgroundRun(
+	key: string,
+	sessionId: string,
+	runId: string,
+	text: string,
+	terminalMs: number,
+): void {
+	const watch = backgroundWatches.get(key);
+	if (watch) claimRun(watch, runId, terminalMs);
+	void activePi?.sendMessage(
+		{
+			customType: "muse-msp-background",
+			content: text,
+			display: true,
+			details: { sessionId, runId },
+		},
+		{ triggerTurn: false },
+	);
+	uiBridges.get(key)?.ui.notify("muse-msp: background run completed — posted to thread", "info");
+}
+
+function pollBackgroundWatch(key: string): void {
+	const watch = backgroundWatches.get(key);
+	if (!watch || !activePi || !BACKGROUND_DELIVERY_ENABLED) return;
+	if (activeTurns.has(key)) return;
+	const live = lives.get(key);
+	if (live && live.sessionId !== watch.sessionId) {
+		// Session replaced under us (fresh start / fork / model jump):
+		// follow it; the floor claims all current history (a fork carries
+		// the whole log) so only strictly newer runs post.
+		watch.sessionId = live.sessionId;
+		watch.delivered.clear();
+		watch.floorMs = Date.now();
+		watch.prevTurnEndMs = -1;
+		watch.lastSize = -1;
+		watch.lastMtimeMs = -1;
+		return;
+	}
+	const sessionId = live?.sessionId ?? watch.sessionId;
+	const path = museSessionJsonl(sessionId);
+	if (!path) return;
+	let stat: { size: number; mtimeMs: number };
+	try {
+		stat = statSync(path);
+	} catch {
+		return;
+	}
+	if (stat.size === watch.lastSize && stat.mtimeMs === watch.lastMtimeMs) return;
+	watch.lastSize = stat.size;
+	watch.lastMtimeMs = stat.mtimeMs;
+	let posted = 0;
+	for (const run of completedRunsFromLog(sessionId)) {
+		if (run.terminalMs < watch.floorMs || watch.delivered.has(run.runId)) continue;
+		if (posted >= BACKGROUND_POST_MAX_PER_TICK) break;
+		posted += 1;
+		deliverBackgroundRun(key, sessionId, run.runId, run.text, run.terminalMs);
+	}
+}
+
+/** Minimum answer length for containment attribution: short texts match
+ * too easily as substrings ("OK" is inside "broke"). */
+const BACKGROUND_CONTAINS_MIN_CHARS = 40;
+
+/** A turn settled with its session kept live: baseline the watcher and
+ * start polling while idle. Claims runs that finished before the previous
+ * turn ended (before this turn started on first arming: never backfill)
+ * plus runs matching this turn's answer (never re-post). Anything newer
+ * with different text — including background runs that completed DURING
+ * this turn — stays unclaimed and posts at the next idle tick. */
+function noteKeptSession(
+	key: string,
+	sessionId: string,
+	turn: { startMs: number; endMs: number; text: string },
+): void {
+	if (!BACKGROUND_DELIVERY_ENABLED) return;
+	let watch = backgroundWatches.get(key);
+	if (watch && watch.sessionId !== sessionId) {
+		if (watch.timer) clearInterval(watch.timer);
+		backgroundWatches.delete(key);
+		watch = undefined;
+	}
+	if (!watch) {
+		watch = {
+			sessionId,
+			delivered: new Map(),
+			floorMs: -1,
+			prevTurnEndMs: -1,
+			lastSize: -1,
+			lastMtimeMs: -1,
+			timer: null,
+		};
+		backgroundWatches.set(key, watch);
+	}
+	const horizonMs = watch.prevTurnEndMs >= 0 ? watch.prevTurnEndMs : turn.startMs;
+	const turnText = normalizeAnswerText(turn.text);
+	for (const run of completedRunsFromLog(sessionId)) {
+		if (run.terminalMs < horizonMs) {
+			claimRun(watch, run.runId, run.terminalMs);
+			continue;
+		}
+		const runText = normalizeAnswerText(run.text);
+		if (
+			runText === turnText ||
+			(runText.length >= BACKGROUND_CONTAINS_MIN_CHARS && turnText.includes(runText))
+		) {
+			claimRun(watch, run.runId, run.terminalMs);
+		}
+	}
+	watch.prevTurnEndMs = turn.endMs;
+	if (!watch.timer) {
+		const timer = setInterval(() => {
+			try {
+				pollBackgroundWatch(key);
+			} catch (error) {
+				debugLog(`background poll failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}, BACKGROUND_POLL_MS);
+		// Headless `pi -p` must exit after its turn: never pin the loop.
+		timer.unref();
+		watch.timer = timer;
+	}
+}
+
+function stopBackgroundWatch(key: string): void {
+	const watch = backgroundWatches.get(key);
+	if (!watch) return;
+	if (watch.timer) clearInterval(watch.timer);
+	backgroundWatches.delete(key);
+}
+
+function stopAllBackgroundWatches(): void {
+	for (const key of [...backgroundWatches.keys()]) stopBackgroundWatch(key);
+}
+
+/** Event-driven delivery trigger. The host emits turn/status notifications
+ * for background wakes too (wiretap-verified on a scratch host: a monitor
+ * wake arrives as turn/started + item deltas + turn/completed under a fresh
+ * turnId, plus session/statusChanged running→idle). These persistent
+ * handlers — never torn down like the per-turn ones — nudge the watch so
+ * delivery lands seconds after the wake instead of at the next poll tick.
+ * The interval poll stays as the backstop (missed frames, restarts). */
+function nudgeBackgroundWatch(sessionId: string): void {
+	if (!BACKGROUND_DELIVERY_ENABLED || !sessionId) return;
+	for (const [key, watch] of backgroundWatches) {
+		if (watch.sessionId !== sessionId) continue;
+		try {
+			// pollBackgroundWatch itself skips mid-turn chats, preserving
+			// the defer-to-idle rule for runs that complete during a turn.
+			pollBackgroundWatch(key);
+		} catch (error) {
+			debugLog(`background nudge failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+}
+
+host.onNotification("turn/completed", (params) => {
+	nudgeBackgroundWatch(strField(params, "sessionId"));
+});
+host.onNotification("session/statusChanged", (params) => {
+	if (strField(params, "status") !== "idle") return;
+	nudgeBackgroundWatch(strField(params, "sessionId"));
+});
 
 function bareModelId(id: string): string {
 	return id.includes("/") ? id.split("/").slice(1).join("/") : id;
@@ -1782,6 +2051,7 @@ export function streamMuseMsp(
 		let queueVisionRetry = (_images: MspImage[]): void => {};
 		let liveEntry: LiveSession | null = null;
 		let liveKeyStr = "";
+		const turnStartMs = Date.now();
 		// Bytes per itemId already emitted via item/delta, so item/completed
 		// (full snapshot) only appends the unseen tail instead of duplicating.
 		const streamedByItem = new Map<string, number>();
@@ -1829,6 +2099,9 @@ export function streamMuseMsp(
 		};
 
 		let releaseTurn: (() => void) | null = null;
+		const turnAnswerText = (): string =>
+			output.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+
 		const finish = (reason: "stop" | "error" | "aborted", errorMessage?: string) => {
 			if (settled) return;
 			debugLog(`finish(${reason})${errorMessage ? `: ${errorMessage.slice(0, 200)}` : ""}`);
@@ -1849,6 +2122,11 @@ export function streamMuseMsp(
 				liveEntry.prefixFp = fingerprintMessages(context.messages);
 				lives.set(liveKeyStr, liveEntry);
 				savePersistedSessions();
+				noteKeptSession(liveKeyStr, sessionId, {
+					startMs: turnStartMs,
+					endMs: Date.now(),
+					text: turnAnswerText(),
+				});
 			} else if (liveKeyStr) {
 				lives.delete(liveKeyStr);
 				// The next turn's context event re-registers its bridge, so a
@@ -1862,6 +2140,7 @@ export function streamMuseMsp(
 				// which merges surviving disk entries back.
 				removePersistedSession(liveKeyStr);
 				savePersistedSessions();
+				stopBackgroundWatch(liveKeyStr);
 			}
 			if (reason === "error" || reason === "aborted") {
 				output.errorMessage = errorMessage ?? "Muse MSP turn failed";
@@ -2834,6 +3113,7 @@ async function mspSkillSummary(preferredSessionId?: string): Promise<string> {
 }
 
 export default function museMsp(pi: ExtensionAPI): void {
+	activePi = pi;
 	pi.registerEntryRenderer<MuseActivity>("muse-msp-activity", (entry, { expanded }, theme) => {
 		const activity = entry.data;
 		if (!activity) return new Text("", 0, 0);
@@ -2896,6 +3176,8 @@ export default function museMsp(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", (event) => {
 		if (event.reason === "new") forgetMspSessions();
 		uiBridges.clear();
+		stopAllBackgroundWatches();
+		activePi = null;
 		// /reload creates a new extension module instance. Always reap this
 		// instance's provider and host so neither can retain stale state.
 		unregisterApiProviders(API_PROVIDER_SOURCE);

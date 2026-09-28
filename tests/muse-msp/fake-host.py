@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import datetime, json, os, signal, sys, time
+import datetime, json, os, signal, sys, threading, time
 
 
 def delayed_sigterm(_signum, _frame):
@@ -144,6 +144,29 @@ def write_durable_completed(session_id, turn_id, text):
     with open(path, "a") as output:
         for record in records:
             output.write(json.dumps(record) + "\n")
+
+
+bg_event_scheduled = False
+
+
+def fire_bg_event():
+    # A background wake completing while idle: durable records plus the same
+    # wire notifications the real host emits for one (wiretap-verified on a
+    # scratch host: foreign turnId, turn/completed, status back to idle).
+    write_durable_completed(session_id, "bg-event-run", "BG-EVENT-ANSWER")
+    notify("turn/completed", {"sessionId": session_id, "turnId": "bg-event-run", "terminal": "completed"})
+    notify("session/statusChanged", {"sessionId": session_id, "status": "idle"})
+
+
+def schedule_bg_event():
+    global bg_event_scheduled
+    if bg_event_scheduled:
+        return
+    bg_event_scheduled = True
+    delay = float(os.environ.get("FAKE_BG_EVENT_AFTER_S", "5") or 5)
+    timer = threading.Timer(delay, fire_bg_event)
+    timer.daemon = True
+    timer.start()
 
 
 for line in sys.stdin:
@@ -308,6 +331,9 @@ for line in sys.stdin:
             notify("item/updated", {"sessionId": session_id, "item": {"itemId": "tc-2", "turnId": turn_id, "kind": "toolCall", "tool": "bash", "args": "{\"command\": \"sleep 60\"}", "background": True}})
             notify("item/completed", {"sessionId": session_id, "item": {"itemId": "answer", "turnId": turn_id, "kind": "agentMessage", "text": "ITEMS-ANSWER"}})
             notify("turn/completed", {"sessionId": session_id, "turnId": turn_id, "terminal": "completed"})
+        # Independent top-up: a background wake completing after the turn.
+        if os.environ.get("FAKE_BG_EVENT") == "1":
+            schedule_bg_event()
     elif method == "approval/listPending":
         if os.environ.get("FAKE_RESUME_PENDING") == "1":
             result(message, {"approvals": [{

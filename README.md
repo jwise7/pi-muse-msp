@@ -30,6 +30,8 @@ Platform: macOS/Linux. Durable-log recovery reads Muse sessions under `~/.local/
 | `PI_MUSE_MSP_SANDBOXED` | unset (unsandboxed) | `1` to serve with workspace trust instead of `--disable-sandbox` |
 | `PI_MUSE_MSP_DEBUG` | unset | `1` for MSP wire debug on stderr |
 | `PI_MUSE_MSP_FINGERPRINT` | unset (no check) | Expected `muse serve` schema fingerprint; when set, a mismatch warns in diagnostics |
+| `PI_MUSE_MSP_BACKGROUND` | unset (enabled) | `0` disables idle background-completion delivery to the thread |
+| `PI_MUSE_MSP_BACKGROUND_MS` | `15000` | Idle poll interval (ms, min 250) for background-completion delivery |
 
 Model list is live from `model/list` with a static Spark fallback. Spark sessions start with `providerId: "meta"` so retained tool-read images keep working.
 
