@@ -42,7 +42,7 @@ const PROVIDER_ID = "muse-msp";
 const MSP_API = "muse-msp" as Api;
 const API_PROVIDER_SOURCE = "local:muse-msp";
 const MSP_FINGERPRINT = process.env.PI_MUSE_MSP_FINGERPRINT?.trim() ?? "";
-const CLIENT_VERSION = "0.2.5";
+const CLIENT_VERSION = "0.2.6";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -2985,15 +2985,18 @@ function modelDefinition(id: string, name: string) {
 	};
 }
 
-// Wonder models live in the local Muse catalog (muse-wonder-1.0 is even the
-// catalog default) well before `muse serve` advertises them over MSP
-// `model/list`, which on some builds returns spark rows only. session/start
-// accepts the wonder ids and turns run on them (pong-verified), so register
-// them statically; when a future server listing includes them, the live rows
-// win by id and these entries are skipped.
+// Some builds' MSP `model/list` omits ids that `session/start` still
+// accepts (verified on Muse 1.4.6: the listing carries wonder-1.0 plus
+// spark-1.3/1.2 only, while the wonder-contributor and both spark
+// contributor ids start sessions fine). A successful refresh REPLACES the
+// static fallback with the live rows, so register those omissions here to
+// keep them in the picker on every path; when a future server listing
+// includes them, the live rows win by id and these entries are skipped.
 const EXTRA_MODELS = [
 	{ id: "muse-wonder-1.0", name: "muse-wonder-1.0" },
 	{ id: "muse-wonder-1.0-contributor", name: "muse-wonder-1.0-contributor" },
+	{ id: "muse-spark-1.3-contributor", name: "muse-spark-1.3-contributor" },
+	{ id: "muse-spark-1.2-contributor", name: "muse-spark-1.2-contributor" },
 ];
 
 type MspModel = ReturnType<typeof modelDefinition>;

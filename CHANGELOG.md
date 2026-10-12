@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.6
+
+- Keep the contributor models in the picker across live refreshes: `muse
+  serve` `model/list` on Muse 1.4.6 lists only `muse-wonder-1.0`,
+  `muse-spark-1.3`, and `muse-spark-1.2`, and a successful refresh replaces
+  the static fallback with exactly those rows — so `muse-spark-1.3-contributor`
+  and `muse-spark-1.2-contributor` vanished after every refresh even though
+  `session/start` accepts them (verified). Both contributor ids join the
+  static `EXTRA_MODELS` union alongside the wonder pair, so all seven entries
+  survive on every registration path. Live rows still win by id when a future
+  server lists them.
+
 ## 0.2.5
 
 - Register Muse Wonder models statically: `muse-wonder-1.0` and

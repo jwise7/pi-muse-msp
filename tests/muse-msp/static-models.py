@@ -2,10 +2,12 @@
 """Statically registered models survive an empty live model/list.
 
 The fake host answers model/list with zero rows (like `muse serve` builds
-whose listing omits wonder while the catalog ships it), so the extension
-falls back to its static list. muse-wonder-1.0 must still resolve:
-set_model succeeds and the next turn's session/start carries modelId
-muse-wonder-1.0 with no providerId override (default routing, not meta).
+whose listing omits ids the server still accepts), so the extension falls
+back to its static list. All four EXTRA ids (muse-wonder-1.0,
+muse-wonder-1.0-contributor, muse-spark-1.3-contributor,
+muse-spark-1.2-contributor) must resolve via set_model, and a turn on
+muse-wonder-1.0 must carry modelId muse-wonder-1.0 with no providerId
+override (default routing, not meta).
 """
 import json
 import pathlib
@@ -21,6 +23,17 @@ proc = harness.spawn(root, log, extra_env={"FAKE_REASONING": "1"},
                      input_log=input_log)
 
 try:
+    # Every statically registered id must resolve, including the contributor
+    # ids the live model/list omits (a refresh replaces the fallback with the
+    # live rows, so these only survive via the EXTRA union).
+    for seq, model_id in enumerate(["muse-wonder-1.0-contributor",
+                                    "muse-spark-1.3-contributor",
+                                    "muse-spark-1.2-contributor"]):
+        switched = harness.rpc_call(proc, {"id": f"pre{seq}", "type": "set_model",
+                                           "provider": "muse-msp",
+                                           "modelId": model_id})
+        assert switched.get("success") is True, (model_id, switched)
+
     switched = harness.rpc_call(proc, {"id": "s1", "type": "set_model",
                                        "provider": "muse-msp",
                                        "modelId": "muse-wonder-1.0"})
