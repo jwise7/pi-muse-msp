@@ -238,6 +238,7 @@ subprocess.run(['python3', str(here / 'salvage-fresh.py')], check=True, timeout=
 subprocess.run(['python3', str(here / 'steer.py')], check=True, timeout=30)
 subprocess.run(['python3', str(here / 'turn-lifecycle.py')], check=True, timeout=120)
 subprocess.run(['python3', str(here / 'model-switch.py')], check=True, timeout=60)
+subprocess.run(['python3', str(here / 'static-models.py')], check=True, timeout=60)
 subprocess.run(['python3', str(here / 'subscribers.py')], check=True, timeout=90)
 subprocess.run(['python3', str(here / 'subagents.py')], check=True, timeout=90)
 subprocess.run(['python3', str(here / 'commands.py')], check=True, timeout=120)
@@ -248,4 +249,4 @@ subprocess.run(['python3', str(here / 'background-delivery.py')], check=True, ti
 for suite in ('proposals-inbox.py', 'session-context.py', 'memory-propose.py',
               'ask-approve-conformance.py'):
     subprocess.run(['python3', str(here / suite)], check=True, timeout=90)
-print('PASS: version sync, event recovery, bounded repeated failure, duplicate/resolved approvals, image log recovery, compaction context, system transcript, host generation isolation, pre-ack durable recovery, live-view progress hold, headless userInput cancel, hung-RPC bounds, vision retry, salvage-fresh, mid-turn steer, turn lifecycle, model switch, subscribers, subagent drill-down, workspace trust, persisted resume, background delivery, machine-local suites')
+print('PASS: version sync, event recovery, bounded repeated failure, duplicate/resolved approvals, image log recovery, compaction context, system transcript, host generation isolation, pre-ack durable recovery, live-view progress hold, headless userInput cancel, hung-RPC bounds, vision retry, salvage-fresh, mid-turn steer, turn lifecycle, model switch, static models, subscribers, subagent drill-down, workspace trust, persisted resume, background delivery, machine-local suites')

@@ -42,7 +42,7 @@ const PROVIDER_ID = "muse-msp";
 const MSP_API = "muse-msp" as Api;
 const API_PROVIDER_SOURCE = "local:muse-msp";
 const MSP_FINGERPRINT = process.env.PI_MUSE_MSP_FINGERPRINT?.trim() ?? "";
-const CLIENT_VERSION = "0.2.4";
+const CLIENT_VERSION = "0.2.5";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -2985,6 +2985,30 @@ function modelDefinition(id: string, name: string) {
 	};
 }
 
+// Wonder models live in the local Muse catalog (muse-wonder-1.0 is even the
+// catalog default) well before `muse serve` advertises them over MSP
+// `model/list`, which on some builds returns spark rows only. session/start
+// accepts the wonder ids and turns run on them (pong-verified), so register
+// them statically; when a future server listing includes them, the live rows
+// win by id and these entries are skipped.
+const EXTRA_MODELS = [
+	{ id: "muse-wonder-1.0", name: "muse-wonder-1.0" },
+	{ id: "muse-wonder-1.0-contributor", name: "muse-wonder-1.0-contributor" },
+];
+
+type MspModel = ReturnType<typeof modelDefinition>;
+
+function withExtraModels(models: MspModel[]): MspModel[] {
+	const seen = new Set(models.map((model) => model.id));
+	for (const extra of EXTRA_MODELS) {
+		if (!seen.has(extra.id)) {
+			models.push(modelDefinition(extra.id, extra.name));
+			seen.add(extra.id);
+		}
+	}
+	return models;
+}
+
 /** Posture for model refresh: reuse any existing host (listing models must
  * never respawn — that would kill live sessions); otherwise prefer what is
  * actually known (env, then the last turn's posture) and default to
@@ -2994,7 +3018,7 @@ function refreshPosture(): boolean {
 }
 
 async function refreshMuseMspModels(sandboxed: boolean) {
-	const models = FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name));
+	const models = withExtraModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name)));
 	try {
 		await host.ensure(sandboxed);
 		const result = await host.request("model/list", {}, { ms: HOST_RPC_TIMEOUT_MS, label: "model/list" });
@@ -3008,7 +3032,7 @@ async function refreshMuseMspModels(sandboxed: boolean) {
 			);
 			const defaultRow = rows.find((row) => row["isDefault"] === true);
 			if (defaultRow) live.unshift(modelDefinition("muse-spark", "Muse Spark (server default)"));
-			return live.filter((model) => model.id);
+			return withExtraModels(live.filter((model) => model.id));
 		}
 	} catch {
 		// Fall through to the static list; execution surfaces the host error.
@@ -3152,7 +3176,7 @@ export default function museMsp(pi: ExtensionAPI): void {
 		baseUrl: "http://localhost",
 		apiKey: "muse-msp-local",
 		api: MSP_API,
-		models: FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name)),
+		models: withExtraModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name))),
 		refreshModels: () => refreshMuseMspModels(refreshPosture()),
 		streamSimple,
 	});

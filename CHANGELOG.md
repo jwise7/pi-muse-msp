@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.5
+
+- Register Muse Wonder models statically: `muse-wonder-1.0` and
+  `muse-wonder-1.0-contributor` now appear in the Pi model picker even
+  though `muse serve` `model/list` (verified on Muse 1.4.6) advertises
+  spark rows only. The ids pass straight through to `session/start`,
+  which accepts them — a pong turn completed on `muse-wonder-1.0` over
+  MSP. When a future server lists wonder rows itself, the live entries
+  take over by id. Requires a Muse build whose catalog ships wonder
+  (1.4.6 does); older builds fail the turn with the server's
+  unknown-model error.
+
 ## 0.2.4
 
 Tested against Pi 0.87.1 (`pi-ai` / `pi-ai/compat` provider API).
