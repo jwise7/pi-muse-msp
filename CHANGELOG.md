@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.7
+
+- Map live `model/list` metadata onto Pi model definitions instead of
+  stamping every model with the static 1M/128k/full-thinking defaults:
+  `contextLimit`/`outputLimit` become `contextWindow`/`maxTokens`, priced
+  rows carry their `cost` rates, and `variants` (plus
+  `reasoningEffortVariants` tiers) become the `thinkingLevelMap`, with
+  unlisted tiers marked unsupported (`null`). Verified against Muse
+  1.4.6, whose rows report `contextLimit: 1007997` — not the rounded
+  1,000,000 previously hardcoded — and whose spark-1.2 rows top out at
+  `xhigh` (no `max`). Rows with missing or unusable limits fall back to
+  the static defaults, rows with no variant field keep the full map, and
+  the static spark-1.2 entries now carry their known xhigh ceiling so
+  the offline fallback matches. New `model-metadata.py` regression
+  covers the live-row parsing.
+- The `muse-spark` server-default alias now inherits the default row's
+  real limits and tiers instead of the static defaults, and sub-1 limit
+  values can no longer floor to a zero context window or output cap.
+- Fix the one outstanding `tsc` error (steer-fallback discriminant
+  check) so the extension typechecks clean, and fix the persistence
+  regression's Pi version parsing for Pi 1.x (`1.0.0` was read as a
+  pre-0.86 minor version).
+- Note for users with a curated Pi `enabledModels` list: the picker is
+  scoped to that list, so add `muse-msp/muse-wonder-1.0` and
+  `muse-msp/muse-wonder-1.0-contributor` to see the Wonder models —
+  no extension release can opt a model into a user's allowlist.
+
 ## 0.2.6
 
 - Keep the contributor models in the picker across live refreshes: `muse

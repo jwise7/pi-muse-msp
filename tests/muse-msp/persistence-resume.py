@@ -68,8 +68,8 @@ assert len(entries) == 1, entries
 # Pi 0.86+ prepends a transcript system message, so a single-message turn
 # persists messageCount 2 there (1 on older Pi).
 pi_version = subprocess.run(["pi", "--version"], text=True, capture_output=True, timeout=10).stdout.strip()
-pi_minor = int(pi_version.split(".")[1]) if len(pi_version.split(".")) >= 2 else 0
-assert entries[0][1]["messageCount"] == (2 if pi_minor >= 86 else 1), entries
+pi_parts = tuple(int(part) for part in pi_version.split(".") if part.isdigit())
+assert entries[0][1]["messageCount"] == (2 if pi_parts >= (0, 86) else 1), entries
 adopted_id = entries[0][1]["sessionId"]
 
 # run2: same Pi session continued in a new process adopts the persisted session

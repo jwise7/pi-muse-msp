@@ -185,6 +185,27 @@ for line in sys.stdin:
     elif method == "model/list":
         if os.environ.get("FAKE_HANG_MODELLIST") == "1":
             continue
+        if os.environ.get("FAKE_MODELLIST_META") == "1":
+            # Mirror the Muse 1.4.6 wire shape (camelCase limits, variant
+            # tier names, null cost) plus one small model and one row with
+            # unusable limits that must fall back to the static defaults.
+            result(message, {"models": [
+                {"modelId": "muse-wonder-1.0", "displayLabel": "muse-wonder-1.0",
+                 "providerId": "meta", "contextLimit": 1007997, "outputLimit": 128000,
+                 "cost": None, "isDefault": True,
+                 "variants": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                 "reasoningEffortVariants": [], "defaultReasoningEffort": "high"},
+                {"modelId": "test-small", "displayLabel": "Test Small",
+                 "providerId": "meta", "contextLimit": 200000, "outputLimit": 32000,
+                 "cost": {"input": 1.5, "output": 6, "cacheRead": 0.5, "cacheWrite": 2},
+                 "isDefault": False,
+                 "variants": ["low", "medium", "high"],
+                 "reasoningEffortVariants": [], "defaultReasoningEffort": "medium"},
+                {"modelId": "test-nolimits", "displayLabel": "Test NoLimits",
+                 "providerId": "meta", "contextLimit": 0, "outputLimit": "bad",
+                 "cost": None, "isDefault": False},
+            ]})
+            continue
         result(message, {"models": []})
     elif method == "skill/list":
         result(message, {"skills": [

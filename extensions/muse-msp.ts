@@ -42,7 +42,7 @@ const PROVIDER_ID = "muse-msp";
 const MSP_API = "muse-msp" as Api;
 const API_PROVIDER_SOURCE = "local:muse-msp";
 const MSP_FINGERPRINT = process.env.PI_MUSE_MSP_FINGERPRINT?.trim() ?? "";
-const CLIENT_VERSION = "0.2.6";
+const CLIENT_VERSION = "0.2.7";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -2956,32 +2956,72 @@ export function streamMuseMsp(
 // Models (live model/list, static fallback)
 // ---------------------------------------------------------------------------
 
-const FALLBACK_MODELS = [
+const FALLBACK_MODELS: Array<{ id: string; name: string; modelId: string | undefined; variants?: string[] }> = [
 	{ id: "muse-spark", name: "Muse Spark (server default)", modelId: undefined as string | undefined },
 	{ id: "muse-spark-1.3", name: "muse-spark-1.3", modelId: "muse-spark-1.3" },
 	{ id: "muse-spark-1.3-contributor", name: "muse-spark-1.3-contributor", modelId: "muse-spark-1.3-contributor" },
-	{ id: "muse-spark-1.2", name: "muse-spark-1.2", modelId: "muse-spark-1.2" },
-	{ id: "muse-spark-1.2-contributor", name: "muse-spark-1.2-contributor", modelId: "muse-spark-1.2-contributor" },
+	// Spark 1.2 tops out at xhigh in the Muse 1.4.6 catalog (no max tier);
+	// live rows re-derive this from `variants` whenever the server lists it.
+	{ id: "muse-spark-1.2", name: "muse-spark-1.2", modelId: "muse-spark-1.2", variants: ["minimal", "low", "medium", "high", "xhigh"] as string[] | undefined },
+	{ id: "muse-spark-1.2-contributor", name: "muse-spark-1.2-contributor", modelId: "muse-spark-1.2-contributor", variants: ["minimal", "low", "medium", "high", "xhigh"] as string[] | undefined },
 ];
 
-function modelDefinition(id: string, name: string) {
+const THINKING_TIERS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+function positiveLimit(value: unknown, fallback: number): number {
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+	return Number.isFinite(parsed) && Math.floor(parsed) > 0 ? Math.floor(parsed) : fallback;
+}
+
+function costRate(value: unknown): number {
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+/** Thinking tiers a live row advertises, or null when the row carries no
+ * variant information at all (older servers: keep the full static map). */
+function advertisedTiers(meta: Record<string, unknown>): Set<string> | null {
+	const tiers = new Set<string>();
+	let sawVariantField = false;
+	if (Array.isArray(meta["variants"])) {
+		sawVariantField = true;
+		for (const tier of meta["variants"]) {
+			if (typeof tier === "string" && (THINKING_TIERS as readonly string[]).includes(tier)) tiers.add(tier);
+		}
+	}
+	if (Array.isArray(meta["reasoningEffortVariants"])) {
+		sawVariantField = true;
+		for (const entry of meta["reasoningEffortVariants"]) {
+			const tier = entry && typeof entry === "object" ? (entry as Record<string, unknown>)["tier"] : undefined;
+			if (typeof tier === "string" && (THINKING_TIERS as readonly string[]).includes(tier)) tiers.add(tier);
+		}
+	}
+	return sawVariantField ? tiers : null;
+}
+
+function modelDefinition(id: string, name: string, meta?: Record<string, unknown>) {
+	const tiers = meta ? advertisedTiers(meta) : null;
+	const thinkingLevelMap: Record<string, string | null> = { off: "off" };
+	for (const tier of THINKING_TIERS) {
+		thinkingLevelMap[tier] = tiers === null || tiers.has(tier) ? tier : null;
+	}
+	const cost = meta && meta["cost"] && typeof meta["cost"] === "object"
+		? (meta["cost"] as Record<string, unknown>)
+		: {};
 	return {
 		id,
 		name,
-		reasoning: true,
-		thinkingLevelMap: {
-			off: "off",
-			minimal: "minimal",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: "max",
-		},
+		reasoning: tiers === null ? true : tiers.size > 0,
+		thinkingLevelMap,
 		input: ["text", "image"] as Array<"text" | "image">,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 1_000_000,
-		maxTokens: 128_000,
+		cost: {
+			input: costRate(cost["input"]),
+			output: costRate(cost["output"]),
+			cacheRead: costRate(cost["cacheRead"]),
+			cacheWrite: costRate(cost["cacheWrite"]),
+		},
+		contextWindow: positiveLimit(meta?.["contextLimit"] ?? meta?.["context_limit"], 1_000_000),
+		maxTokens: positiveLimit(meta?.["outputLimit"] ?? meta?.["output_limit"], 128_000),
 	};
 }
 
@@ -2992,11 +3032,11 @@ function modelDefinition(id: string, name: string) {
 // static fallback with the live rows, so register those omissions here to
 // keep them in the picker on every path; when a future server listing
 // includes them, the live rows win by id and these entries are skipped.
-const EXTRA_MODELS = [
+const EXTRA_MODELS: Array<{ id: string; name: string; variants?: string[] }> = [
 	{ id: "muse-wonder-1.0", name: "muse-wonder-1.0" },
 	{ id: "muse-wonder-1.0-contributor", name: "muse-wonder-1.0-contributor" },
 	{ id: "muse-spark-1.3-contributor", name: "muse-spark-1.3-contributor" },
-	{ id: "muse-spark-1.2-contributor", name: "muse-spark-1.2-contributor" },
+	{ id: "muse-spark-1.2-contributor", name: "muse-spark-1.2-contributor", variants: ["minimal", "low", "medium", "high", "xhigh"] },
 ];
 
 type MspModel = ReturnType<typeof modelDefinition>;
@@ -3005,7 +3045,7 @@ function withExtraModels(models: MspModel[]): MspModel[] {
 	const seen = new Set(models.map((model) => model.id));
 	for (const extra of EXTRA_MODELS) {
 		if (!seen.has(extra.id)) {
-			models.push(modelDefinition(extra.id, extra.name));
+			models.push(modelDefinition(extra.id, extra.name, extra.variants ? { variants: extra.variants } : undefined));
 			seen.add(extra.id);
 		}
 	}
@@ -3021,7 +3061,7 @@ function refreshPosture(): boolean {
 }
 
 async function refreshMuseMspModels(sandboxed: boolean) {
-	const models = withExtraModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name)));
+	const models = withExtraModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name, model.variants ? { variants: model.variants } : undefined)));
 	try {
 		await host.ensure(sandboxed);
 		const result = await host.request("model/list", {}, { ms: HOST_RPC_TIMEOUT_MS, label: "model/list" });
@@ -3031,10 +3071,11 @@ async function refreshMuseMspModels(sandboxed: boolean) {
 				modelDefinition(
 					String(row["modelId"] ?? ""),
 					String(row["displayLabel"] ?? row["modelId"] ?? ""),
+					row,
 				),
 			);
 			const defaultRow = rows.find((row) => row["isDefault"] === true);
-			if (defaultRow) live.unshift(modelDefinition("muse-spark", "Muse Spark (server default)"));
+			if (defaultRow) live.unshift(modelDefinition("muse-spark", "Muse Spark (server default)", defaultRow));
 			return withExtraModels(live.filter((model) => model.id));
 		}
 	} catch {
@@ -3179,7 +3220,7 @@ export default function museMsp(pi: ExtensionAPI): void {
 		baseUrl: "http://localhost",
 		apiKey: "muse-msp-local",
 		api: MSP_API,
-		models: withExtraModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name))),
+		models: withExtraModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name, model.variants ? { variants: model.variants } : undefined))),
 		refreshModels: () => refreshMuseMspModels(refreshPosture()),
 		streamSimple,
 	});
@@ -3224,7 +3265,7 @@ export default function museMsp(pi: ExtensionAPI): void {
 			event.text,
 			event.images,
 		);
-		if (!outcome.ok) {
+		if (outcome.ok === false) {
 			debugLog(`native steer fell back to Pi queue: ${outcome.reason}`);
 			return { action: "continue" };
 		}
