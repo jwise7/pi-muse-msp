@@ -33,7 +33,7 @@ Platform: macOS/Linux. Durable-log recovery reads Muse sessions under `~/.local/
 | `PI_MUSE_MSP_BACKGROUND` | unset (enabled) | `0` disables idle background-completion delivery to the thread |
 | `PI_MUSE_MSP_BACKGROUND_MS` | `15000` | Idle poll interval (ms, min 250) for background-completion delivery |
 
-Model list is live from `model/list` with a static fallback; live rows carry their real context/output limits, cost, and thinking tiers into Pi's model definitions. Spark sessions start with `providerId: "meta"` so retained tool-read images keep working.
+Model list is live from `model/list` with a static fallback; live rows carry their real context/output limits, cost, and thinking tiers into Pi's model definitions. On macOS/Linux, chat models from Muse's local catalog (`~/.local/share/muse/model-catalog/`, or `$XDG_DATA_HOME/muse/model-catalog`) union behind the live rows, so tier-gated ids the server omits still reach the picker; image-generation and non-chat catalog rows are skipped. Spark sessions start with `providerId: "meta"` so retained tool-read images keep working.
 
 To pin the fingerprint, copy the live value from `/muse-msp-doctor` into `PI_MUSE_MSP_FINGERPRINT`; future turns then warn if the host schema drifts.
 

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
@@ -2989,9 +2989,10 @@ function advertisedTiers(meta: Record<string, unknown>): Set<string> | null {
 			if (typeof tier === "string" && (THINKING_TIERS as readonly string[]).includes(tier)) tiers.add(tier);
 		}
 	}
-	if (Array.isArray(meta["reasoningEffortVariants"])) {
+	const effortVariants = meta["reasoningEffortVariants"] ?? meta["reasoning_effort_variants"];
+	if (Array.isArray(effortVariants)) {
 		sawVariantField = true;
-		for (const entry of meta["reasoningEffortVariants"]) {
+		for (const entry of effortVariants) {
 			const tier = entry && typeof entry === "object" ? (entry as Record<string, unknown>)["tier"] : undefined;
 			if (typeof tier === "string" && (THINKING_TIERS as readonly string[]).includes(tier)) tiers.add(tier);
 		}
@@ -3041,6 +3042,74 @@ const EXTRA_MODELS: Array<{ id: string; name: string; variants?: string[] }> = [
 
 type MspModel = ReturnType<typeof modelDefinition>;
 
+/** Secondary discovery from Muse's local model catalog
+ * (`<data-home>/muse/model-catalog/*.json`, macOS/Linux layout; the same
+ * tree the durable-log recovery already reads under `~/.local/share`).
+ * Tier-gated or otherwise unlisted chat models (a future `*-full`, say)
+ * appear here before any server listing carries them, so unioning these
+ * rows keeps the picker complete without another static-list release.
+ * Defensive by design: Windows is skipped (different data-home layout),
+ * unreadable or malformed files are ignored, image-generation rows and
+ * rows with neither a context limit nor reasoning variants (not chat
+ * models) are skipped, and ids already present win over catalog rows.
+ * A catalog row for a tier the user cannot actually start still
+ * registers; the server's unknown-model error surfaces at turn time,
+ * exactly as with the static extras below. */
+function catalogModels(): MspModel[] {
+	if (process.platform === "win32") return [];
+	const dataHome = process.env.XDG_DATA_HOME?.trim();
+	const dir = dataHome
+		? join(dataHome, "muse", "model-catalog")
+		: join(homeDir(), ".local", "share", "muse", "model-catalog");
+	let files: string[];
+	try {
+		files = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
+	} catch {
+		return [];
+	}
+	const models: MspModel[] = [];
+	const seen = new Set<string>();
+	for (const file of files) {
+		let rows: unknown;
+		try {
+			const parsed = JSON.parse(readFileSync(join(dir, file), "utf8")) as Record<string, unknown>;
+			rows = parsed["rows"];
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(rows)) continue;
+		for (const raw of rows) {
+			if (!raw || typeof raw !== "object") continue;
+			const row = raw as Record<string, unknown>;
+			const id = String(row["model_id"] ?? row["modelId"] ?? "");
+			if (!id || seen.has(id)) continue;
+			if (row["supports_image_generation"] === true || row["supportsImageGeneration"] === true) continue;
+			const variants = row["reasoning_effort_variants"] ?? row["reasoningEffortVariants"];
+			const hasContext = positiveLimit(row["context_limit"] ?? row["contextLimit"], 0) > 0;
+			if (!hasContext && !(Array.isArray(variants) && variants.length > 0)) continue;
+			seen.add(id);
+			models.push(modelDefinition(id, String(row["display_label"] ?? row["displayLabel"] ?? id), {
+				contextLimit: row["context_limit"] ?? row["contextLimit"],
+				outputLimit: row["output_limit"] ?? row["outputLimit"],
+				reasoningEffortVariants: variants,
+				cost: row["cost"],
+			}));
+		}
+	}
+	return models;
+}
+
+function withCatalogModels(models: MspModel[]): MspModel[] {
+	const seen = new Set(models.map((model) => model.id));
+	for (const model of catalogModels()) {
+		if (!seen.has(model.id)) {
+			models.push(model);
+			seen.add(model.id);
+		}
+	}
+	return models;
+}
+
 function withExtraModels(models: MspModel[]): MspModel[] {
 	const seen = new Set(models.map((model) => model.id));
 	for (const extra of EXTRA_MODELS) {
@@ -3061,7 +3130,7 @@ function refreshPosture(): boolean {
 }
 
 async function refreshMuseMspModels(sandboxed: boolean) {
-	const models = withExtraModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name, model.variants ? { variants: model.variants } : undefined)));
+	const models = withExtraModels(withCatalogModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name, model.variants ? { variants: model.variants } : undefined))));
 	try {
 		await host.ensure(sandboxed);
 		const result = await host.request("model/list", {}, { ms: HOST_RPC_TIMEOUT_MS, label: "model/list" });
@@ -3076,7 +3145,7 @@ async function refreshMuseMspModels(sandboxed: boolean) {
 			);
 			const defaultRow = rows.find((row) => row["isDefault"] === true);
 			if (defaultRow) live.unshift(modelDefinition("muse-spark", "Muse Spark (server default)", defaultRow));
-			return withExtraModels(live.filter((model) => model.id));
+			return withExtraModels(withCatalogModels(live.filter((model) => model.id)));
 		}
 	} catch {
 		// Fall through to the static list; execution surfaces the host error.
@@ -3220,7 +3289,7 @@ export default function museMsp(pi: ExtensionAPI): void {
 		baseUrl: "http://localhost",
 		apiKey: "muse-msp-local",
 		api: MSP_API,
-		models: withExtraModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name, model.variants ? { variants: model.variants } : undefined))),
+		models: withExtraModels(withCatalogModels(FALLBACK_MODELS.map((model) => modelDefinition(model.id, model.name, model.variants ? { variants: model.variants } : undefined)))),
 		refreshModels: () => refreshMuseMspModels(refreshPosture()),
 		streamSimple,
 	});

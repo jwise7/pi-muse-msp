@@ -22,6 +22,18 @@
   check) so the extension typechecks clean, and fix the persistence
   regression's Pi version parsing for Pi 1.x (`1.0.0` was read as a
   pre-0.86 minor version).
+- Discover additional chat models from Muse's local model catalog
+  (`~/.local/share/muse/model-catalog/*.json`, or
+  `$XDG_DATA_HOME/muse/model-catalog`; macOS/Linux only). Catalog rows
+  union behind live `model/list` rows and ahead of the static extras,
+  carrying their snake_case limits and reasoning tiers, so tier-gated
+  ids a server listing omits — a future `muse-wonder-full-1.0`, say —
+  reach the picker without another static-list release. Image-generation
+  rows, rows with neither a context limit nor reasoning variants, and
+  malformed catalog files are skipped; a catalog id the user's tier
+  cannot start fails at turn time with the server's unknown-model
+  error, as static extras already do. New `model-catalog.py`
+  regression covers the union and exclusions.
 - Note for users with a curated Pi `enabledModels` list: the picker is
   scoped to that list, so add `muse-msp/muse-wonder-1.0` and
   `muse-msp/muse-wonder-1.0-contributor` to see the Wonder models —
